@@ -1,0 +1,205 @@
+# uk-aq-ingestdb-prune behavior
+
+This document describes what the prune function does at runtime.
+
+## Purpose
+
+`POST /run` verifies that ingest observations older than the configured ingest retention window are present in history with identical content, then deletes only verified ingest buckets.
+
+Bucket key is:
+
+- `connector_id`
+- `hour_start` (`date_trunc('hour', observed_at)` in UTC)
+
+## Core flow
+
+1. Build UTC window:
+- `window_end = UTC midnight today - INGESTDB_RETENTION_DAYS`
+- `window_start = window_end - MAX_HOURS_PER_RUN`
+- If `MAX_HOURS_PER_RUN > 24`, split into sequential 24-hour internal batches and process each batch in order.
+
+0. Phase B pre-prune history gate:
+- Before fingerprint compare/delete work, the service runs Phase B R2 History export for closed UTC days through `utc_today - (INGESTDB_RETENTION_DAYS + 1 days)`.
+- Example: on `2026-03-17`, with `INGESTDB_RETENTION_DAYS=7`, latest eligible day is `2026-03-09`; with `INGESTDB_RETENTION_DAYS=5`, latest eligible day is `2026-03-11`.
+- Observations source rows are streamed through server-side projection function `uk_aq_ops.uk_aq_phase_b_history_rows` by `(day_utc, connector_id)` and written to R2 Parquet with ZSTD compression.
+- Observations part rollover defaults to `1,000,000` rows per file.
+- Observations write each part directly to committed prefix (`history/v1/observations/...`) and persist resume checkpoint state after each part so retries continue from the last committed tuple instead of re-reading full-day rows.
+- AQI levels are exported in the same run for completed observation days that are missing AQI day manifests; AQI rows are streamed from `uk_aq_aqilevels.timeseries_aqi_hourly` grouped by connector and written to `history/v1/aqilevels/...`.
+- AQI export preserves rows where `station_id` is null (instead of dropping them), so connector/day row-count validation stays aligned with source RPC totals.
+- Phase B writes manifests, verifies object existence, and updates:
+  - `uk_aq_ops.history_candidates`
+  - `uk_aq_ops.prune_day_gates.history_done`
+- After a successful non-dry Phase B history export, the service rebuilds derived R2 index manifests from committed day manifests and connector manifests:
+  - `history/_index/observations_latest.json`
+  - `history/_index/aqilevels_latest.json`
+  - `history/_index/observations_timeseries_latest.json`
+  - `history/_index/observations_timeseries/day_utc=YYYY-MM-DD/connector_id=<id>/manifest.json`
+- Index rebuild is best-effort:
+  - failures are logged as `phase_b_history_index_rebuild_failed`
+  - prune compare/delete work continues, so core prune safety is not blocked by index refresh drift
+- `uk_aq_ops.prune_day_gates.history_done` continues to gate prune deletes using observation backup completion.
+- Legacy staging objects are still cleaned up by retention policy (`history/v1/_ops/observations/staging/...`) to drain old runs.
+- Prune deletion for an hour bucket is allowed only when that bucket day has `history_done=true`.
+
+2. Fetch hourly summaries via RPC from both DBs:
+- ingest: `uk_aq_public.uk_aq_rpc_observations_hourly_fingerprint`
+- history: `uk_aq_public.uk_aq_rpc_observations_hourly_fingerprint`
+- Hash inputs include `connector_id`, `timeseries_id`, `observed_at`, and `value` (status is excluded in both DBs).
+
+3. Compare buckets by `(connector_id, hour_start)`:
+- missing in history -> mismatch
+- count differs -> mismatch
+- fingerprint differs -> mismatch
+- count and fingerprint equal -> deletable
+
+Comparison scope rule:
+
+- A bucket must exist in ingest to be checked for parity and considered for deletion.
+- Buckets that exist only in history are not treated as mismatches for delete gating.
+
+4. Log structured results:
+- mismatches at `ERROR`
+- deletable plan at `INFO`
+- history-only buckets at `INFO` with event `history_extra_buckets`
+
+## Dry-run behavior
+
+When `INGESTDB_PRUNE_DRY_RUN=true`, no delete RPC is called.
+
+If `REPAIR_ONE_MISMATCH_BUCKET=true`, dry-run also runs a repair pilot for one mismatch bucket:
+
+1. Enqueue that bucket’s rows to ingest outbox via:
+- `uk_aq_public.uk_aq_rpc_observs_outbox_enqueue_hour_bucket`
+
+2. Flush outbox immediately, inside the prune run itself:
+- claim: `uk_aq_public.uk_aq_rpc_observs_outbox_claim`
+- upsert to history: `uk_aq_public.uk_aq_rpc_observs_observations_upsert`
+- receipts upsert: `uk_aq_public.uk_aq_rpc_observs_sync_receipt_daily_upsert`
+- resolve: `uk_aq_public.uk_aq_rpc_observs_outbox_resolve`
+- upsert behavior is timeout-safe: retries transient errors, and on statement timeout recursively splits payload batches before failing.
+- duplicate rows across claimed outbox entries are de-duplicated in-memory by `(connector_id, timeseries_id, observed_at)` before history upsert.
+
+3. Recheck that same bucket with hourly fingerprint RPCs.
+
+Important:
+
+- The prune function does its own outbox flush logic in-process.
+- It does not call the separate `uk-aq-observs-outbox-flush-service` endpoint.
+
+## Live delete behavior
+
+When `INGESTDB_PRUNE_DRY_RUN=false`, the flow is:
+
+1. First compare pass and first delete pass:
+- delete all buckets that already match
+- log mismatches
+
+2. Repair phase:
+- enqueue all repairable mismatch buckets into history outbox
+- flush outbox in-process (same RPC chain as dry-run pilot)
+
+3. Recheck phase:
+- re-run compare for the original mismatch buckets
+- delete buckets that are now verified
+- log buckets that still mismatch after repair
+
+Only one repair/recheck cycle is executed per run.
+
+Delete RPC:
+
+- `uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket`
+
+Each bucket is deleted in bounded batches until:
+
+- delete RPC returns `0` (drained), or
+- `MAX_DELETE_BATCHES_PER_HOUR` is reached (warning + alert condition)
+
+## Guardrails
+
+- All date/hour logic is UTC.
+- No raw row comparison is moved out of DBs for verification; only bucket aggregates are compared.
+- Buckets with any mismatch are skipped from delete in each pass.
+- `history_count > ingest_count` is logged as a specific error condition and not deleted.
+
+## Logging details
+
+- Logs are structured JSON on Cloud Run stdout/stderr and appear in Cloud Logging.
+- On fatal run errors (`ingestdb_prune_run_error`, HTTP `500`), the service also attempts a Dropbox error upload when Dropbox env/secrets are configured.
+- Dropbox error path format: `<UK_AQ_DROPBOX_ROOT>/error_log/YYYY-MM-DD/uk_aq_error_cloud_run_ingestdb_prune_<timestamp>_<uuid>.json`.
+- Dropbox upload uses:
+  - `DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, `DROPBOX_REFRESH_TOKEN`
+  - optional `UK_AQ_DROPBOX_ROOT`
+  - optional `UK_AIR_ERROR_DROPBOX_FOLDER` (default `/error_log`)
+  - optional allowlist gate `UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL` (must match `SUPABASE_URL`/`SB_URL` when set)
+- For batched runs (`MAX_HOURS_PER_RUN > 24`), the service logs:
+  - `ingestdb_prune_batch_plan` at run start
+  - per-batch `ingestdb_prune_run_start`
+  - one final aggregate summary event (`ingestdb_prune_dry_run_batched_summary` or `ingestdb_prune_delete_batched_summary`)
+- History-only buckets (present in history, missing in ingest) are logged once per run as:
+  - `severity=INFO`
+  - `event=history_extra_buckets`
+  - fields: `count` and `sample` (sample bucket list)
+- They are informational only and do not block deletes.
+- This is expected after successful prune runs, because deleted ingest buckets will remain in history.
+
+## Runtime inputs
+
+Required:
+
+- `SUPABASE_URL`
+- `OBS_AQIDB_SUPABASE_URL`
+- `SB_SECRET_KEY`
+- `OBS_AQIDB_SECRET_KEY`
+
+Key optional controls:
+
+- `INGESTDB_PRUNE_DRY_RUN` (default `true`)
+- `INGESTDB_RETENTION_DAYS` (default `5`)
+- `MAX_HOURS_PER_RUN` (default `48`)
+- `DELETE_BATCH_SIZE` (default `50000`)
+- `MAX_DELETE_BATCHES_PER_HOUR` (default `10`)
+- `REPAIR_ONE_MISMATCH_BUCKET` (default `true`)
+- `REPAIR_BUCKET_OUTBOX_CHUNK_SIZE` (default `1000`)
+- `FLUSH_CLAIM_BATCH_LIMIT` (default `20`)
+- `MAX_FLUSH_BATCHES` (default `30`)
+- `UK_AQ_R2_HISTORY_PHASE_B_ENABLED` (default `true`)
+- `UK_AQ_R2_HISTORY_PART_MAX_ROWS` (default `1000000`; shared fallback used by AQI exports when AQI-specific overrides are unset)
+- `UK_AQ_R2_HISTORY_OBSERVATIONS_PART_MAX_ROWS` (default `500000`; observations override, falls back to `UK_AQ_R2_HISTORY_PART_MAX_ROWS`)
+- `UK_AQ_R2_HISTORY_AQILEVELS_PART_MAX_ROWS` (default shared fallback above)
+- `UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS` (default `20000`)
+- `UK_AQ_R2_HISTORY_ROW_GROUP_SIZE` (default `100000`; shared fallback used by AQI exports when AQI-specific overrides are unset)
+- `UK_AQ_R2_HISTORY_OBSERVATIONS_ROW_GROUP_SIZE` (default `50000`; observations override, falls back to `UK_AQ_R2_HISTORY_ROW_GROUP_SIZE`)
+- `UK_AQ_R2_HISTORY_AQILEVELS_ROW_GROUP_SIZE` (default shared fallback above)
+- `UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN` (default `500`)
+- `UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS` (default `7`)
+- `UK_AQ_R2_HISTORY_STAGING_PREFIX` (default `history/v1/_ops/observations/staging`)
+- `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
+- `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels`)
+- `UK_AQ_R2_HISTORY_RUNS_PREFIX` (default `history/v1/_ops/observations/runs`)
+- `UK_AQ_R2_HISTORY_INDEX_PREFIX` (default `history/_index`)
+- `UK_AQ_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX` (default `history/_index/observations_timeseries`)
+- `UK_AQ_DEPLOY_ENV` (`dev|stage|prod`; default `dev`)
+
+Website observation API note:
+- `uk_aq_timeseries` now uses ingestdb for the freshest `24` hours (`UK_AQ_TIMESERIES_INGEST_SOURCE_OF_TRUTH_HOURS`), `obs_aqidb` for the next `6` days in the local `7`-day window (`UK_AQ_TIMESERIES_OBSAQIDB_SOURCE_OF_TRUTH_HOURS`, default `168`), and R2 for older history.
+
+Phase B required env/secrets:
+
+- `SUPABASE_DB_URL` (direct Postgres URL for streaming cursor reads)
+- `CFLARE_R2_ENDPOINT`
+- `CFLARE_R2_REGION` (default `auto`)
+- bucket mapping: `R2_BUCKET_PROD` / `R2_BUCKET_STAGE` / `R2_BUCKET_DEV` (or fallback `CFLARE_R2_BUCKET`)
+- `CFLARE_R2_ACCESS_KEY_ID`
+- `CFLARE_R2_SECRET_ACCESS_KEY`
+
+## Related SQL scripts
+
+- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/ingest_db/ingest_db_ops_rpcs.sql`
+- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/obs_aqi_db/uk_aq_obs_aqi_db_ops_rpcs.sql`
+- Fingerprint RPCs depend on `pgcrypto.digest`; keep `pgcrypto` installed and accessible via function `search_path` (for example `extensions` and/or `public`).
+
+For deployment and scheduler wiring, use:
+
+- `README.md`
+- `.github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml`
+- Scheduler attempt deadline variable: `GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_ATTEMPT_DEADLINE` (fallback aliases accepted), default `15m`.
