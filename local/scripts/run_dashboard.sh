@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Starts the UK AQ dashboard API server.
-# Sources .env from this repo's root. PORT defaults to 8000; set PORT= in .env or env to override.
-# The LIVE repo .env sets PORT=8001.
+# Sources .env from this repo's root. Set PORT env var to override port (default: 8000).
+# The live dashboard launchd plist sets PORT=8001.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
