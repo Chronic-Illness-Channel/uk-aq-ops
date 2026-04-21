@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Installs (or reloads) the three launchd services into ~/Library/LaunchAgents.
-# Run this once after setting up .env.test, .env.live, and ~/.cloudflared/config.yml.
+# Installs (or reloads) the live dashboard launchd service.
+# Run once after setting up .env with live credentials and creating the .venv.
+# The test dashboard and cloudflared tunnel are installed from the CIC-test-uk-aq-ops repo.
 set -euo pipefail
 
 PLIST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,8 +11,7 @@ LOGS_DIR="$(cd "$PLIST_DIR/../.." && pwd)/logs"
 mkdir -p "$AGENTS_DIR" "$LOGS_DIR"
 
 PLISTS=(
-  co.uk.chronicillnesschannel.aq.dashboard.test.plist
-  co.uk.chronicillnesschannel.aq.cloudflared.plist
+  co.uk.chronicillnesschannel.aq.dashboard.live.plist
 )
 
 for plist in "${PLISTS[@]}"; do
@@ -28,10 +28,8 @@ for plist in "${PLISTS[@]}"; do
 done
 
 echo ""
-echo "Services installed. Check status:"
+echo "Live dashboard installed. Check status:"
 echo "  launchctl list | grep chronicillnesschannel"
 echo ""
-echo "View logs:"
-echo "  tail -f $LOGS_DIR/dashboard_test.log"
+echo "View log:"
 echo "  tail -f $LOGS_DIR/dashboard_live.log"
-echo "  tail -f $LOGS_DIR/cloudflared.log"
