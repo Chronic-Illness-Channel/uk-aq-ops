@@ -21,6 +21,8 @@ Cloudflare Tunnel (cloudflared on MacBook)
 
 **Key point**: The Python server (`uk_aq_dashboard_api.py`) serves both the frontend HTML and all
 `/api/*` routes from a single port. There is no separate frontend build step.
+Before starting the server, `local/scripts/run_dashboard.sh` regenerates
+`dashboard/assets/config.js` from `.env` (`UKAQ_*` browser-safe variables).
 
 Both repos contain the same server code and their own Python venv. The scripts are identical —
 only the credentials (each repo's `.env`) and port differ.
@@ -104,8 +106,21 @@ Both dashboards read from their own repo's `.env`. The dashboard-specific vars n
 | `UK_AQ_R2_HISTORY_DAYS_API_URL` | `https://uk-aq-db-r2-metrics-api.cic-test.workers.dev/v1/r2-history-days` | live worker URL |
 | `UK_AQ_R2_HISTORY_COUNTS_API_URL` | `https://uk-aq-db-r2-metrics-api.cic-test.workers.dev/v1/r2-history-counts` | live worker URL |
 | `UK_AQ_DROPBOX_LOCAL_ROOT` | `/Users/mikehinford/Dropbox` | `/Users/mikehinford/Dropbox` |
+| `UKAQ_DASHBOARD_TITLE` | Browser title/header text | Browser title/header text |
+| `UKAQ_DASHBOARD_SUBTITLE` | Browser subtitle text | Browser subtitle text |
 
 Leave live worker URLs empty if not yet deployed.
+
+---
+
+## Storage Coverage Day Presence
+
+- Ingest DB day presence in the calendar now uses exact per-day checks via
+  `uk_aq_public.uk_aq_rpc_observations_hourly_fingerprint` on ingestdb.
+- A day is marked ingest-present only when the fingerprint RPC reports
+  `observation_count > 0` for that UTC day.
+- The previous oldest-day range inference is only used as a fallback if the
+  exact ingest day check is unavailable.
 
 ---
 
