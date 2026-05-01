@@ -39,6 +39,10 @@ Read endpoints:
     - general read routes: up to 2 attempts
     - AQI history route: up to 6 attempts with linear backoff
     - retry statuses: `502`, `503`, `504`
+- `/api/aq/postcode_lookup` -> external postcode lookup R2 API URL (`UK_AQ_POSTCODE_LOOKUP_R2_API_URL`)
+  - uses the long-lived postcode cache profile (`max-age=86400`)
+- `/api/aq/postcode_suggest` -> external postcode suggest R2 API URL (`UK_AQ_POSTCODE_SUGGEST_R2_API_URL`)
+  - uses the long-lived postcode cache profile (`max-age=86400`)
 
 ## Required GitHub env/secret targets
 
@@ -46,6 +50,8 @@ Variables:
 
 - `SUPABASE_URL`
 - `UK_AQ_AQI_HISTORY_R2_API_URL`
+- `UK_AQ_POSTCODE_LOOKUP_R2_API_URL`
+- `UK_AQ_POSTCODE_SUGGEST_R2_API_URL`
 - `UK_AQ_CACHE_ALLOWED_ORIGINS`
 - `UK_AQ_CACHE_WORKER_NAME` (recommended; e.g. `uk-aq-cache-test` / `uk-aq-cache-live`)
 - `UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS` (optional)
