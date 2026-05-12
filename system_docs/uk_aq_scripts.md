@@ -86,5 +86,12 @@ system doc.
     `first_seen`/`first_seen_missing`/`disappeared`/`reappeared`/`changed`
     events. `--max-download-mb` and `--max-runtime-minutes` enforce
     cooperative limits (run ends with `status=stopped_limit`).
-    `--run-backfill` prints the planned narrow command (Phase 4 wires real exec).
-  - Sensor.Community adapter and real backfill execution land in Phases 4 / 5.
+    `--run-backfill` invokes `UK_AQ_BACKFILL_WRAPPER` per changed file
+    (Phase 4 Pass 1): sources `UK_AQ_BACKFILL_ENV_FILE`, sets
+    `RUN_MODE=source_to_r2 / DRY_RUN=false / FORCE_REPLACE=true / TIMESERIES_IDS=<csv> / FROM=TO=<day>`,
+    runs via `bash` with a 30-min safety timeout, records
+    `backfill_triggered / backfill_timeseries_ids / backfill_status` on
+    the event row and `backfills_triggered` on the run row. Failed
+    backfills bump `errors_count`.
+  - Pass 2 (multi-file batching, smoke test against the real wrapper)
+    and the Sensor.Community adapter land later.

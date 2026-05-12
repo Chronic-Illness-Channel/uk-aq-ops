@@ -331,7 +331,7 @@ Python interpreter defaults to `python3`; override with
 --to-day YYYY-MM-DD                     (manual profile or override)
 --dry-run                               No DB writes / no remote calls; logs the snapshot and OpenAQ plan.
 --check-only                            (Phase 5 wires Sensor.Community; OpenAQ already check-only by default)
---run-backfill                          Print the planned narrow backfill command per changed file (Phase 4 wires actual execution).
+--run-backfill                          Invoke UK_AQ_BACKFILL_WRAPPER per changed file (narrow timeseries × day); no-op under --dry-run.
 --max-download-mb N                     Soft cap on per-run downloaded MB (cooperative; checked before each request).
 --max-runtime-minutes N                 Soft cap on per-run runtime minutes (cooperative; checked before each request).
 --force-snapshot-import                 Re-import the core snapshot even if its manifest hash is unchanged.
@@ -1087,12 +1087,48 @@ Delivered:
 - Run report includes an OpenAQ section with per-changed-file event IDs,
   timeseries IDs, and (where applicable) the planned commands.
 
-### Phase 4 — Narrow backfill runner (PLANNED)
+### Phase 4 — Narrow backfill runner (Pass 1 DONE; Pass 2 PLANNED)
 
-Goal: resolve changed OpenAQ files to timeseries IDs and invoke
-`UK_AQ_BACKFILL_WRAPPER` with `UK_AQ_BACKFILL_RUN_MODE=source_to_r2`,
-narrow `UK_AQ_BACKFILL_TIMESERIES_IDS`, and per-day from/to bounds.
-Verify the wrapper supports `UK_AQ_BACKFILL_TIMESERIES_IDS`; add if missing.
+Pass 1 delivered:
+
+- When the OpenAQ adapter emits a `changed` / `first_seen` / `reappeared`
+  event and `--run-backfill` is set (and `--dry-run` is not), the
+  integrity runner invokes `UK_AQ_BACKFILL_WRAPPER` via `bash`
+  with a fresh subprocess env:
+  - vars sourced from `UK_AQ_BACKFILL_ENV_FILE` (bash-ish parser: handles
+    `export`, quoted values, `#` comments)
+  - `UK_AQ_BACKFILL_RUN_MODE=source_to_r2`
+  - `UK_AQ_BACKFILL_DRY_RUN=false`
+  - `UK_AQ_BACKFILL_FORCE_REPLACE=true`
+  - `UK_AQ_BACKFILL_FROM_DAY_UTC=<day>` / `UK_AQ_BACKFILL_TO_DAY_UTC=<day>` (same day)
+  - `UK_AQ_BACKFILL_TIMESERIES_IDS=<csv>` (narrow — only the timeseries
+    attached to the changed file's `source_location_id`)
+  - `UK_AQ_BACKFILL_TRIGGER_MODE=manual`
+- Per-backfill result recorded on the `source_file_events` row:
+  `backfill_triggered`, `backfill_timeseries_ids`,
+  `backfill_status ∈ {ok, error, timeout, no_wrapper, no_env_file,
+  no_timeseries_ids, spawn_error}`, plus stdout/stderr tail (4 KB) and
+  exit code in `notes`.
+- Run-level counters: `integrity_runs.backfills_triggered` is the
+  attempt count; backfill failures bump `errors_count`. The run report
+  surfaces `attempted / ok / failed`.
+- Hard guardrails enforced by construction:
+  - No invocation in `--dry-run` (only the planned command is logged).
+  - No invocation without `--run-backfill`.
+  - Connector-wide force-replace is never used; only per-day per-narrow
+    timeseries list.
+- 1800 s per-call safety timeout (`subprocess.TimeoutExpired` →
+  `status=timeout`).
+
+Pass 2 planned (after budget refresh):
+
+- Multi-file batching: if N changed files share the same day, fold them
+  into one wrapper call with the union of timeseries IDs.
+- Backfill summary table or per-call log file (currently stored as
+  `notes` tail on the event row).
+- Real wrapper integration smoke test (Pass 1 used a fake wrapper).
+- Surface `backfills_ok` / `backfills_failed` as first-class columns on
+  `integrity_runs` (currently only `backfills_triggered`).
 
 ### Phase 5 — Sensor.Community adapter (PLANNED)
 

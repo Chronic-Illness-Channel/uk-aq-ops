@@ -1434,12 +1434,17 @@ def run_narrow_backfill(
     day: dt.date,
     log: logging.Logger,
     timeout_seconds: int = BACKFILL_DEFAULT_TIMEOUT_SECONDS,
+    log_dir: Path | None = None,
+    log_label: str | None = None,
 ) -> dict[str, Any]:
     """Invoke `uk_aq_backfill_local_monthly.sh` for one (timeseries-ids, day).
 
     Returns a result dict suitable for recording on the source_file_events
     row: status in {ok, error, no_wrapper, no_env_file, no_timeseries_ids,
     spawn_error, timeout}, plus exit_code/duration/stdout_tail/stderr_tail/error.
+
+    When log_dir is set, full stdout+stderr is also written to a file under
+    that directory and the path is returned in `log_path`.
     """
     result: dict[str, Any] = {
         "status": None,
@@ -1449,6 +1454,7 @@ def run_narrow_backfill(
         "env_file_path": env_file_path,
         "stdout_tail": "",
         "stderr_tail": "",
+        "log_path": None,
         "error": None,
     }
     if not timeseries_ids:
@@ -1494,6 +1500,9 @@ def run_narrow_backfill(
         "backfill invoke wrapper=%s day=%s timeseries_ids=%s",
         wrapper_path, iso, sub_env["UK_AQ_BACKFILL_TIMESERIES_IDS"],
     )
+
+    stdout_text = ""
+    stderr_text = ""
     try:
         proc = subprocess.run(
             ["bash", wrapper_path],
@@ -1503,20 +1512,49 @@ def run_narrow_backfill(
             timeout=timeout_seconds,
             check=False,
         )
+        stdout_text = proc.stdout or ""
+        stderr_text = proc.stderr or ""
         result["exit_code"] = proc.returncode
-        result["stdout_tail"] = _tail_bytes(proc.stdout)
-        result["stderr_tail"] = _tail_bytes(proc.stderr)
         result["status"] = "ok" if proc.returncode == 0 else "error"
         if proc.returncode != 0:
             result["error"] = f"wrapper exit_code={proc.returncode}"
     except subprocess.TimeoutExpired as exc:
         result["status"] = "timeout"
         result["error"] = f"wrapper timed out after {timeout_seconds}s"
-        result["stdout_tail"] = _tail_bytes(exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, (bytes, bytearray)) else (exc.stdout or ""))
-        result["stderr_tail"] = _tail_bytes(exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, (bytes, bytearray)) else (exc.stderr or ""))
+        if isinstance(exc.stdout, (bytes, bytearray)):
+            stdout_text = exc.stdout.decode("utf-8", errors="replace")
+        else:
+            stdout_text = exc.stdout or ""
+        if isinstance(exc.stderr, (bytes, bytearray)):
+            stderr_text = exc.stderr.decode("utf-8", errors="replace")
+        else:
+            stderr_text = exc.stderr or ""
     except OSError as exc:
         result["status"] = "spawn_error"
         result["error"] = f"spawn failed: {exc}"
+
+    result["stdout_tail"] = _tail_bytes(stdout_text)
+    result["stderr_tail"] = _tail_bytes(stderr_text)
+
+    if log_dir is not None and (stdout_text or stderr_text or result["status"]):
+        log_dir.mkdir(parents=True, exist_ok=True)
+        label = log_label or f"day_{iso}"
+        log_path = log_dir / f"{label}.log"
+        try:
+            with log_path.open("w", encoding="utf-8") as fh:
+                fh.write(f"# wrapper: {wrapper_path}\n")
+                fh.write(f"# env_file: {env_file_path}\n")
+                fh.write(f"# day: {iso}\n")
+                fh.write(f"# timeseries_ids: {sub_env['UK_AQ_BACKFILL_TIMESERIES_IDS']}\n")
+                fh.write(f"# exit_code: {result['exit_code']}\n")
+                fh.write(f"# status: {result['status']}\n")
+                fh.write("\n# === STDOUT ===\n")
+                fh.write(stdout_text)
+                fh.write("\n# === STDERR ===\n")
+                fh.write(stderr_text)
+            result["log_path"] = str(log_path)
+        except OSError as exc:
+            log.warning("backfill log_path write failed: %s", exc)
 
     result["duration_seconds"] = round(time.monotonic() - started, 3)
     log.info(
@@ -1531,13 +1569,18 @@ def _record_backfill_on_event(
     event_id: int,
     timeseries_ids: list[int],
     backfill: dict[str, Any],
+    batch_info: dict[str, Any] | None = None,
 ) -> None:
-    """Update the source_file_events row with backfill outcome columns."""
+    """Update the source_file_events row with backfill outcome columns.
+
+    `timeseries_ids` is the per-event subset (the IDs belonging to this
+    file's `source_location_id`). `batch_info`, when set, captures the
+    larger invocation context — total IDs in the batch and the count of
+    sibling files. Useful when multiple changed files share a day.
+    """
     ids_csv = ",".join(str(t) for t in timeseries_ids) if timeseries_ids else None
     status = backfill.get("status") or "unknown"
     triggered_flag = 1 if status in {"ok", "error", "timeout"} else 0
-    # Combine the run-level error with output tails into the notes column so
-    # we can audit without keeping a separate logfile per backfill.
     notes_parts: list[str] = []
     if backfill.get("error"):
         notes_parts.append(f"error={backfill['error']}")
@@ -1547,6 +1590,13 @@ def _record_backfill_on_event(
         notes_parts.append(f"exit_code={backfill['exit_code']}")
     if backfill.get("duration_seconds"):
         notes_parts.append(f"duration_s={backfill['duration_seconds']}")
+    if backfill.get("log_path"):
+        notes_parts.append(f"log={backfill['log_path']}")
+    if batch_info:
+        notes_parts.append(
+            f"batch: files={batch_info.get('files', 1)} "
+            f"total_timeseries_ids={batch_info.get('total_timeseries_ids', len(timeseries_ids))}"
+        )
     if backfill.get("stdout_tail"):
         notes_parts.append("stdout_tail:\n" + backfill["stdout_tail"])
     if backfill.get("stderr_tail"):
@@ -1580,6 +1630,7 @@ def check_openaq(
     run_backfill: bool,
     limits: LimitTracker,
     log: logging.Logger,
+    run_compact: str,
 ) -> dict[str, Any]:
     """Iterate distinct OpenAQ locations × days; run per-file workflow.
 
@@ -1683,24 +1734,6 @@ def check_openaq(
                         cmd = _planned_backfill_command(env, result["timeseries_ids"], day)
                         metrics["planned_backfills"].append(cmd)
                         log.info("openaq planned backfill: %s", cmd)
-                        if not dry_run and result.get("event_id"):
-                            bf = run_narrow_backfill(
-                                wrapper_path=os.environ.get("UK_AQ_BACKFILL_WRAPPER"),
-                                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
-                                timeseries_ids=result["timeseries_ids"],
-                                day=day,
-                                log=log,
-                            )
-                            _record_backfill_on_event(
-                                conn, int(result["event_id"]),
-                                result["timeseries_ids"], bf,
-                            )
-                            conn.commit()
-                            metrics["backfills_attempted"] += 1
-                            if bf["status"] == "ok":
-                                metrics["backfills_ok"] += 1
-                            else:
-                                metrics["backfills_failed"] += 1
                 bytes_added = int(result.get("downloaded_bytes") or 0)
                 if bytes_added:
                     metrics["downloaded_bytes"] += bytes_added
@@ -1716,6 +1749,56 @@ def check_openaq(
     if limits.should_stop():
         metrics["stopped_for"] = limits.stopped_for
         log.warning("openaq: stopped early due to limit=%s", limits.stopped_for)
+
+    # ---- Phase 4 Pass 2: batched backfill phase ----
+    # All HEAD/download work is complete. Group changed files by day, union
+    # the per-location timeseries IDs, and invoke the wrapper once per day.
+    if run_backfill and not dry_run and metrics["changed_files"]:
+        backfill_log_dir = (
+            Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
+        )
+        by_day: dict[str, list[dict[str, Any]]] = {}
+        for entry in metrics["changed_files"]:
+            by_day.setdefault(entry["day"], []).append(entry)
+        for day_iso in sorted(by_day):
+            if limits.should_stop():
+                log.warning(
+                    "backfill phase: stopping early (%s) — %s days skipped",
+                    limits.stopped_for,
+                    len([d for d in by_day if d > day_iso]),
+                )
+                break
+            group = by_day[day_iso]
+            union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
+            log.info(
+                "backfill batch day=%s files=%s total_timeseries_ids=%s",
+                day_iso, len(group), len(union_ids),
+            )
+            bf = run_narrow_backfill(
+                wrapper_path=os.environ.get("UK_AQ_BACKFILL_WRAPPER"),
+                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                timeseries_ids=union_ids,
+                day=dt.date.fromisoformat(day_iso),
+                log=log,
+                log_dir=backfill_log_dir,
+                log_label=f"day_{day_iso}",
+            )
+            for entry in group:
+                if entry.get("event_id"):
+                    _record_backfill_on_event(
+                        conn, int(entry["event_id"]),
+                        entry["timeseries_ids"], bf,
+                        batch_info={
+                            "files": len(group),
+                            "total_timeseries_ids": len(union_ids),
+                        },
+                    )
+            conn.commit()
+            metrics["backfills_attempted"] += 1
+            if bf["status"] == "ok":
+                metrics["backfills_ok"] += 1
+            else:
+                metrics["backfills_failed"] += 1
 
     log.info("openaq: done %s", {k: v for k, v in metrics.items() if k not in ("changed_files", "planned_backfills", "sample_urls")})
     return metrics
@@ -1849,6 +1932,10 @@ def open_db(db_path: str) -> sqlite3.Connection:
     ensure_columns(conn, "core_snapshot_imports", {
         "snapshot_day_utc": "TEXT",
         "bytes_read": "INTEGER DEFAULT 0",
+    })
+    ensure_columns(conn, "integrity_runs", {
+        "backfills_ok": "INTEGER DEFAULT 0",
+        "backfills_failed": "INTEGER DEFAULT 0",
     })
     conn.commit()
     return conn
@@ -2110,6 +2197,7 @@ def main(argv: list[str]) -> int:
                 run_backfill=args.run_backfill,
                 limits=limits,
                 log=log,
+                run_compact=run_compact,
             )
 
         # Decide top-level run status.
