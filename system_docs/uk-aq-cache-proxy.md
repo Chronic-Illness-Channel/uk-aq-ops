@@ -43,6 +43,9 @@ Read endpoints:
   - uses the long-lived postcode cache profile (`max-age=86400`)
 - `/api/aq/postcode_suggest` -> external postcode suggest R2 API URL (`UK_AQ_POSTCODE_SUGGEST_R2_API_URL`)
   - uses the long-lived postcode cache profile (`max-age=86400`)
+- `/api/aq/latest-snapshot` -> external latest snapshot R2 API URL (`UK_AQ_LATEST_SNAPSHOT_R2_API_URL`)
+  - serves deterministic latest snapshot objects from R2 (`pollutant/window/network_group`)
+  - uses realtime cache profile (`max-age=60`)
 
 ## Required GitHub env/secret targets
 
@@ -50,6 +53,7 @@ Variables:
 
 - `SUPABASE_URL`
 - `UK_AQ_AQI_HISTORY_R2_API_URL`
+- `UK_AQ_LATEST_SNAPSHOT_R2_API_URL`
 - `UK_AQ_POSTCODE_LOOKUP_R2_API_URL`
 - `UK_AQ_POSTCODE_SUGGEST_R2_API_URL`
 - `UK_AQ_CACHE_ALLOWED_ORIGINS`
@@ -94,3 +98,4 @@ Worker naming:
 - Upstream edge functions must validate `X-UK-AQ-Upstream-Auth` with the same `UK_AQ_EDGE_UPSTREAM_SECRET`.
 - Same-origin browser requests are accepted even when `Origin` is omitted (fallback uses `Sec-Fetch-Site: same-origin` or same-origin `Referer`).
 - Response diagnostics include `X-UK-AQ-Upstream-Attempts` and (when retries were used) `X-UK-AQ-Upstream-Retry`.
+- For full latest snapshot pipeline details (Cloud Run builder + latest snapshot R2 API worker + cache proxy handoff), see `system_docs/uk-aq-latest-snapshot.md`.
