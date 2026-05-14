@@ -38,17 +38,19 @@
 
 ## Backfill scripts
 
-- `scripts/uk_aq_backfill_local_monthly.sh`
-  - Runs local backfill month-by-month (`local_to_aqilevels`, `obs_aqi_to_r2`, `source_to_r2`, `r2_history_obs_to_aqilevels`).
+- `scripts/uk_aq_backfill_local.sh`
+  - Runs local backfill (`local_to_aqilevels`, `obs_aqi_to_r2`, `source_to_r2`, `r2_history_obs_to_aqilevels`).
   - Always forces `UK_AQ_BACKFILL_TRIGGER_MODE=manual` for local runs.
   - Resolves the backfill runner from:
     - `UK_AQ_BACKFILL_RUN_JOB_PATH` (optional override), else
-    - `workers/uk_aq_backfill_cloud_run/run_job.ts`.
+    - `workers/uk_aq_backfill_local/run_job.ts`.
   - Archive paths are treated as retired and are not valid runner paths for active runs.
   - Supports local run throttling:
-    - `UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_MINUTE` (default `0`, disabled)
-    - `UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_HOUR` (default `0`, disabled)
-  - Existing spacing control still applies via `UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS`.
+    - `UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE` (default `0`, disabled)
+    - `UK_AQ_BACKFILL_MAX_RUNS_PER_HOUR` (default `0`, disabled)
+  - Existing spacing control still applies via `UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS`.
+  - Full behavior and merge-mode details are documented in:
+    - [`uk-aq-backfill-local.md`](uk-aq-backfill-local.md)
 
 ## History integrity scripts
 
@@ -75,7 +77,7 @@ system doc.
     `core_stations_snapshot`, `core_timeseries_snapshot`,
     `core_phenomena_snapshot`, and rebuilds
     `source_station_timeseries_lookup` for `openaq` and
-    `sensor-community`. Reuses on unchanged manifest hash;
+    `sensorcommunity`. Reuses on unchanged manifest hash;
     `--force-snapshot-import` overrides; `--skip-snapshot-import` for
     debug; `--dry-run` reports without writing.
   - Phase 3: OpenAQ adapter — HEADs `https://openaq-data-archive.s3.amazonaws.com`
@@ -86,12 +88,23 @@ system doc.
     `first_seen`/`first_seen_missing`/`disappeared`/`reappeared`/`changed`
     events. `--max-download-mb` and `--max-runtime-minutes` enforce
     cooperative limits (run ends with `status=stopped_limit`).
-    `--run-backfill` invokes `UK_AQ_BACKFILL_WRAPPER` per changed file
-    (Phase 4 Pass 1): sources `UK_AQ_BACKFILL_ENV_FILE`, sets
-    `RUN_MODE=source_to_r2 / DRY_RUN=false / FORCE_REPLACE=true / TIMESERIES_IDS=<csv> / FROM=TO=<day>`,
-    runs via `bash` with a 30-min safety timeout, records
-    `backfill_triggered / backfill_timeseries_ids / backfill_status` on
-    the event row and `backfills_triggered` on the run row. Failed
-    backfills bump `errors_count`.
-  - Pass 2 (multi-file batching, smoke test against the real wrapper)
-    and the Sensor.Community adapter land later.
+    `--run-backfill` invokes `UK_AQ_BACKFILL_WRAPPER` (Phase 4):
+    sources `UK_AQ_BACKFILL_ENV_FILE`, sets
+    `RUN_MODE=source_to_r2 / DRY_RUN=false / FORCE_REPLACE=true /
+    TIMESERIES_IDS=<csv> / FROM=TO=<day>`, runs via `bash` with a
+    30-min safety timeout. Changed files are **batched per day** —
+    one wrapper call per day with the union of affected timeseries
+    IDs. Records `backfill_triggered / backfill_timeseries_ids /
+    backfill_status` on each event row, full stdout/stderr to
+    `state/<ENV>/logs/backfill/<run_compact>/day_<YYYY-MM-DD>.log`,
+    and `backfills_triggered / backfills_ok / backfills_failed` on
+    the run row. Failed backfills bump `errors_count`.
+  - Phase 5: Sensor.Community adapter — fetches the daily archive
+    index `https://archive.sensor.community/<YYYY-MM-DD>/`
+    (overridable via `UK_AQ_HISTORY_INTEGRITY_SENSOR_COMMUNITY_BASE_URL`),
+    parses HTML for `sensor_id -> filename`, then HEAD/download/hash
+    each matched file. Plain CSV (no gzip).
+    `state/<ENV>/source-cache/sensorcommunity/<YYYY-MM-DD>/<filename>.csv`.
+    Backfills are batched per day at the end of the SC scan, identical
+    to the OpenAQ flow. `--max-download-mb` / `--max-runtime-minutes`
+    span both adapters via a shared `LimitTracker`.
