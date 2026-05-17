@@ -10,6 +10,7 @@ import {
   resolveR2HistoryIndexConfig,
 } from "../shared/uk_aq_r2_history_index.mjs";
 
+
 const DEFAULT_LOOKBACK_DAYS = 28;
 const MAX_LOOKBACK_DAYS = 120;
 const R2_HISTORY_DAYS_MAX_LOOKBACK_DAYS = 3660;
