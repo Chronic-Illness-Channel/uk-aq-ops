@@ -1,11 +1,74 @@
+// INVARIANT: index payloads written by this module must be byte-identical
+// run-to-run when the underlying source data hasn't changed. Every field
+// (including `generated_at`, key ordering, number formatting, optional
+// fields, etc.) needs to be derived from the source data — never from
+// wall-clock time, run IDs, or other run-scoped state.
+//
+// Why this matters: any byte change rotates the R2 etag, which invalidates
+// the etag-skip baseline used by scripts/backup_r2/build_backup_inventory.mjs.
+// A blanket churn forces the next inventory build to re-read every changed
+// manifest (hours of `rclone cat` round-trips) AND the Dropbox sync to
+// re-upload every one of them (hours more, plus Dropbox write-rate
+// throttling). The 2026-05-17 transition to a data-driven `generated_at`
+// produced exactly this cascade — see commit 2aa79d5.
+//
+// When editing this file, treat byte-stability as a load-bearing property.
+// If you add a new field, source it from the manifests; if you need a
+// timestamp, derive it from `max(source.backed_up_at_utc)` or similar.
+
+import { createHash } from "node:crypto";
 import {
   hasRequiredR2Config,
   normalizePrefix,
   r2GetObject,
+  r2HeadObject,
   r2ListAllCommonPrefixes,
   r2PutObject,
   sha256Hex,
 } from "./r2_sigv4.mjs";
+
+// MD5 hex of the body bytes — matches the etag R2 returns for single-part
+// PUTs (all our manifests are small enough that R2 never splits them).
+function md5HexOfBody(body) {
+  const buf = typeof body === "string" ? Buffer.from(body, "utf-8") : body;
+  return createHash("md5").update(buf).digest("hex");
+}
+
+function stripEtagQuotes(etag) {
+  if (!etag) return null;
+  const cleaned = String(etag).trim().replace(/^["W\/]+|"+$/g, "").toLowerCase();
+  return cleaned || null;
+}
+
+// Idempotent PUT: HEAD the existing object, compare its etag with the MD5 of
+// the new body, skip the PUT if they match. Avoids re-writing R2 objects
+// every rebuild when the payload content is byte-identical (a common case
+// once `generated_at` is data-driven). Saves R2 PUT operations *and* keeps
+// downstream consumers — like the Dropbox backup builder — fast by not
+// churning their etag-skip baseline.
+async function r2PutObjectIfChanged({ r2, key, body, content_type }) {
+  const newMd5 = md5HexOfBody(body);
+  const bodyBytes = typeof body === "string"
+    ? Buffer.byteLength(body, "utf-8")
+    : body.length;
+
+  let existingEtag = null;
+  try {
+    const head = await r2HeadObject({ r2, key });
+    if (head?.exists) {
+      existingEtag = stripEtagQuotes(head.etag);
+    }
+  } catch (_err) {
+    // HEAD failure is non-fatal — treat as "unknown" and proceed to PUT.
+  }
+
+  if (existingEtag && existingEtag === newMd5) {
+    return { key, etag: existingEtag, bytes: bodyBytes, skipped: true };
+  }
+
+  const result = await r2PutObject({ r2, key, body, content_type });
+  return { ...result, skipped: false };
+}
 
 // Phase 6.5 Pass A backfill (Path 2): parquet-wasm + arrow read paths.
 // Imported lazily on first use so the module's cold-start cost stays low
@@ -134,6 +197,20 @@ function toIsoOrNull(value) {
     return null;
   }
   return new Date(ms).toISOString();
+}
+
+// Pick the latest ISO timestamp from an array of strings. Used to derive
+// data-driven `generated_at` values for aggregate index files so they stay
+// byte-stable run-to-run when underlying sources haven't changed.
+function pickMaxIsoTimestamp(values) {
+  let maxMs = -Infinity;
+  for (const value of (Array.isArray(values) ? values : [])) {
+    if (typeof value !== "string" || !value.trim()) continue;
+    const ms = Date.parse(value);
+    if (Number.isNaN(ms)) continue;
+    if (ms > maxMs) maxMs = ms;
+  }
+  return maxMs === -Infinity ? null : new Date(maxMs).toISOString();
 }
 
 function buildDayCutoff(maxLookbackDays, todayDay = new Date().toISOString().slice(0, 10)) {
@@ -553,7 +630,7 @@ async function maybePatchConnectorManifestWithCounts({
   };
   const newHash = sha256Hex(JSON.stringify(patchedWithoutHash));
   const patched = { ...patchedWithoutHash, manifest_hash: newHash };
-  await r2PutObject({
+  await r2PutObjectIfChanged({
     r2,
     key: manifestKey,
     body: `${JSON.stringify(patched, null, 2)}\n`,
@@ -613,7 +690,14 @@ function buildObservationTimeseriesConnectorIndexPayload({
 
   return {
     schema_version: OBSERVATIONS_TIMESERIES_INDEX_SCHEMA_VERSION,
-    generated_at: toIsoOrNull(generatedAt) || new Date().toISOString(),
+    // Data-driven: prefer the source connector manifest's backed_up_at_utc so
+    // this index payload is byte-identical run-to-run when source data didn't
+    // change. Falls back to caller-supplied generatedAt (which may still be
+    // wall-clock from a default-arg) only when the source has no timestamp.
+    generated_at:
+      toIsoOrNull(connectorManifest?.backed_up_at_utc)
+      || toIsoOrNull(generatedAt)
+      || null,
     source: "r2_connector_manifest",
     domain: "observations",
     index_kind: "timeseries_file_ranges",
@@ -717,7 +801,11 @@ function buildAqilevelTimeseriesConnectorIndexPayload({
 
   return {
     schema_version: AQILEVELS_TIMESERIES_INDEX_SCHEMA_VERSION,
-    generated_at: toIsoOrNull(generatedAt) || new Date().toISOString(),
+    // Data-driven: see buildObservationTimeseriesConnectorIndexPayload note.
+    generated_at:
+      toIsoOrNull(connectorManifest?.backed_up_at_utc)
+      || toIsoOrNull(generatedAt)
+      || null,
     source: "r2_connector_manifest",
     domain: "aqilevels",
     index_kind: "timeseries_file_ranges",
@@ -866,7 +954,14 @@ export function buildDomainIndexPayload({
   );
   return {
     schema_version: INDEX_SCHEMA_VERSION,
-    generated_at: toIsoOrNull(generatedAt) || new Date().toISOString(),
+    // Data-driven: derive from the latest source day-manifest's backed_up_at_utc
+    // so this payload is byte-identical run-to-run when underlying day manifests
+    // didn't change. Falls back to caller-supplied generatedAt only when no
+    // source has a timestamp.
+    generated_at:
+      pickMaxIsoTimestamp(sortedSummaries.map((entry) => entry?.backed_up_at_utc))
+      || toIsoOrNull(generatedAt)
+      || new Date().toISOString(),
     source: "r2_day_manifests",
     domain: normalizedDomain,
     bucket: String(bucket || "").trim() || null,
@@ -1048,7 +1143,7 @@ export async function rebuildR2HistoryIndexForDomain({
   });
   const indexKey = buildR2HistoryIndexKey(indexPrefix, normalizedDomain);
   const body = `${JSON.stringify(payload, null, 2)}\n`;
-  const putResult = await r2PutObject({
+  const putResult = await r2PutObjectIfChanged({
     r2,
     key: indexKey,
     body,
@@ -1059,6 +1154,7 @@ export async function rebuildR2HistoryIndexForDomain({
     domain: normalizedDomain,
     index_key: indexKey,
     index_bytes: putResult.bytes,
+    index_put_skipped: Boolean(putResult.skipped),
     day_prefix_count: dayList.length,
     indexed_day_count: payload.day_count,
     total_rows: payload.total_rows,
@@ -1149,7 +1245,7 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
               target.connector_id,
             );
             const body = `${JSON.stringify(payload, null, 2)}\n`;
-            await r2PutObject({
+            const putResult = await r2PutObjectIfChanged({
               r2,
               key: connectorIndexKey,
               body,
@@ -1160,6 +1256,8 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
               index_key: connectorIndexKey,
               file_count: payload.file_count,
               indexed_file_count: payload.indexed_file_count,
+              put_skipped: Boolean(putResult.skipped),
+              backed_up_at_utc: payload.backed_up_at_utc,
             };
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -1204,7 +1302,16 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
 
   const latestPayload = {
     schema_version: OBSERVATIONS_TIMESERIES_INDEX_SCHEMA_VERSION,
-    generated_at: toIsoOrNull(generatedAt) || new Date().toISOString(),
+    // Data-driven: see buildDomainIndexPayload note. Derived from the latest
+    // backed_up_at_utc across all per-(day, connector) index payloads.
+    generated_at:
+      pickMaxIsoTimestamp(
+        daySummaries.flatMap((entry) =>
+          (entry.connector_indexes || []).map((c) => c.backed_up_at_utc),
+        ),
+      )
+      || toIsoOrNull(generatedAt)
+      || new Date().toISOString(),
     source: "r2_connector_manifests",
     domain: "observations",
     index_kind: "timeseries_file_ranges",
@@ -1232,7 +1339,7 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
 
   const latestKey = buildR2HistoryObservationsTimeseriesLatestKey(indexPrefix);
   const latestBody = `${JSON.stringify(latestPayload, null, 2)}\n`;
-  const latestPut = await r2PutObject({
+  const latestPut = await r2PutObjectIfChanged({
     r2,
     key: latestKey,
     body: latestBody,
@@ -1244,6 +1351,7 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
     index_kind: "timeseries_file_ranges",
     latest_index_key: latestKey,
     latest_index_bytes: latestPut.bytes,
+    latest_index_put_skipped: Boolean(latestPut.skipped),
     observations_timeseries_index_prefix: normalizedTimeseriesPrefix,
     indexed_day_count: latestPayload.day_count,
     connector_index_count: connectorIndexCount,
@@ -1325,7 +1433,7 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
               target.connector_id,
             );
             const body = `${JSON.stringify(payload, null, 2)}\n`;
-            await r2PutObject({
+            const putResult = await r2PutObjectIfChanged({
               r2,
               key: connectorIndexKey,
               body,
@@ -1336,6 +1444,8 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
               index_key: connectorIndexKey,
               file_count: payload.file_count,
               indexed_file_count: payload.indexed_file_count,
+              put_skipped: Boolean(putResult.skipped),
+              backed_up_at_utc: payload.backed_up_at_utc,
             };
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -1380,7 +1490,15 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
 
   const latestPayload = {
     schema_version: AQILEVELS_TIMESERIES_INDEX_SCHEMA_VERSION,
-    generated_at: toIsoOrNull(generatedAt) || new Date().toISOString(),
+    // Data-driven: see buildDomainIndexPayload note.
+    generated_at:
+      pickMaxIsoTimestamp(
+        daySummaries.flatMap((entry) =>
+          (entry.connector_indexes || []).map((c) => c.backed_up_at_utc),
+        ),
+      )
+      || toIsoOrNull(generatedAt)
+      || new Date().toISOString(),
     source: "r2_connector_manifests",
     domain: "aqilevels",
     index_kind: "timeseries_file_ranges",
@@ -1408,7 +1526,7 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
 
   const latestKey = buildR2HistoryAqilevelsTimeseriesLatestKey(indexPrefix);
   const latestBody = `${JSON.stringify(latestPayload, null, 2)}\n`;
-  const latestPut = await r2PutObject({
+  const latestPut = await r2PutObjectIfChanged({
     r2,
     key: latestKey,
     body: latestBody,
@@ -1420,6 +1538,7 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
     index_kind: "timeseries_file_ranges",
     latest_index_key: latestKey,
     latest_index_bytes: latestPut.bytes,
+    latest_index_put_skipped: Boolean(latestPut.skipped),
     aqilevels_timeseries_index_prefix: normalizedTimeseriesPrefix,
     indexed_day_count: latestPayload.day_count,
     connector_index_count: connectorIndexCount,

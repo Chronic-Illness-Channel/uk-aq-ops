@@ -39,21 +39,13 @@ The runner supports these modes:
 
 Primary (preferred) env vars:
 
-- `UK_AQ_BACKFILL_LOCAL_LOG_DIR` (default `logs/backfill/local`)
+- `UK_AQ_BACKFILL_LOCAL_LOG_DIR` (default `/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/<UK_AQ_DROPBOX_ROOT>/uk-aq-backfill-local-logs`, falling back to `.../CIC-Test/...` when `UK_AQ_DROPBOX_ROOT` is unset)
 - `UK_AQ_BACKFILL_LOCAL_STOP_ON_ERROR` (default `true`)
 - `UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS` (default `0`)
 - `UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE` (default `0`, disabled)
 - `UK_AQ_BACKFILL_MAX_RUNS_PER_HOUR` (default `0`, disabled)
 - `UK_AQ_BACKFILL_PAUSE_SECONDS` (legacy alias for run interval)
-
-Compatibility aliases still accepted:
-
-- `UK_AQ_BACKFILL_MONTHLY_LOG_DIR`
-- `UK_AQ_BACKFILL_MONTHLY_STOP_ON_ERROR`
-- `UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS`
-- `UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_MINUTE`
-- `UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_HOUR`
-- `UK_AQ_BACKFILL_MONTHLY_PAUSE_SECONDS`
+- `UK_AQ_BACKFILL_OUTPUT_SCOPE` (default `default`)
 
 ## Metadata source rules
 
@@ -112,28 +104,57 @@ For each `(day_utc, connector_id)`:
 7. Upload merged connector outputs to live R2 (replace connector/day objects).
 8. Rebuild day-level manifests from connector manifests.
 
-If local Dropbox baseline manifests are missing for targeted merge,
-backfill fails that connector/day to avoid destructive partial rewrite.
+### No-data tolerance
 
-## AQI handling
+The `source_to_r2` path has two "missing data" branches that used to fail and now write the manifest anyway. Both are intentional, both apply only to OpenAQ today.
 
-In `source_to_r2`, AQI outputs are always rebuilt alongside observations for
-successful connector/day writes.
+1. **Source genuinely has no data** (OpenAQ S3 returned `found:false` for every candidate location, `locationFilesFound === 0`). Treated as *authoritative-no-data*: writes an empty connector manifest (`file_count: 0`, `source_row_count: 0`, `files: []`) and the corresponding day manifest, instead of skipping. Distinguished from transport errors by the explicit per-location outcome counters (`found / missing / error`); transport errors still propagate and abort the chunk. Logged via `source_to_r2_openaq_empty_manifest_written` and `source_to_r2_openaq_no_data_classification` with `class: "authoritative_no_data" | "transport_error" | "metadata_mismatch"`. The classification is persisted in the ledger checkpoint as `no_data_classification`.
 
-For targeted merge mode:
+2. **Targeted merge has no local-history baseline** (`loadObsRowsForConnectorDayFromLocalHistory` and/or its AQI counterpart returned null — typical for days the original ingest missed). Treated as *no preservation needed*: continues with `preservedObsRows = []`, writes only the replacement rows for the targeted timeseries as a fresh connector + day manifest. Logged via `source_to_r2_targeted_merge_no_local_history` and recorded in the ledger checkpoint as `targeted_local_history_missing: true`.
 
-- non-target AQI rows are preserved from local backup
-- target AQI rows are recomputed from replacement observation rows
+Metadata-mismatch skips remain skips (no manifest written) — these are configuration errors, not no-data:
+
+- `no_matching_requested_timeseries_ids` — requested IDs don't exist in the connector lookup
+- `no_matching_location_ids_after_timeseries_filter` — requested IDs map to no OpenAQ locations
+
+Adapters other than OpenAQ keep the original skip-on-no-data behaviour; extend per-adapter as needed.
+
+## AQI handling / output scope
+
+`UK_AQ_BACKFILL_OUTPUT_SCOPE` controls which outputs are allowed:
+
+- `default`
+  - Existing behavior.
+  - `source_to_r2` writes observations and AQI history outputs.
+  - `r2_history_obs_to_aqilevels` rebuilds AQI history outputs.
+- `observations_only` (valid only with `source_to_r2`)
+  - Writes observation history outputs only.
+  - Does not build/export/write AQI history parquet/manifests.
+  - Skip guard only checks observation rows (`obsHistoryRows.length`).
+- `aqilevels_only` (valid only with `r2_history_obs_to_aqilevels`)
+  - Rebuilds AQI history outputs only from committed R2 observation history.
+
+Invalid run-mode/output-scope combinations fail before any R2 mutation.
 
 ## Key env vars for integrity-triggered runs
 
 Integrity uses wrapper + env file and sets:
 
 - `UK_AQ_BACKFILL_RUN_MODE=source_to_r2`
+- `UK_AQ_BACKFILL_OUTPUT_SCOPE=observations_only`
 - `UK_AQ_BACKFILL_FORCE_REPLACE=true`
 - `UK_AQ_BACKFILL_FROM_DAY_UTC=<day>`
 - `UK_AQ_BACKFILL_TO_DAY_UTC=<day>`
 - `UK_AQ_BACKFILL_TIMESERIES_IDS=<csv>`
+
+AQI rebuild pass uses:
+
+- `UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels`
+- `UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only`
+- `UK_AQ_BACKFILL_FORCE_REPLACE=true`
+- `UK_AQ_BACKFILL_CONNECTOR_IDS=<connector_id>`
+- `UK_AQ_BACKFILL_FROM_DAY_UTC=<day>`
+- `UK_AQ_BACKFILL_TO_DAY_UTC=<day>`
 
 Recommended supporting vars in the backfill env file:
 

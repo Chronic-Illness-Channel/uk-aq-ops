@@ -24,6 +24,7 @@ import {
   narrowRowsToDayRange as narrowRowsToDayRangeCore,
   parseBooleanish,
   parseConnectorIds,
+  parseBackfillOutputScope,
   parseIsoDayUtc,
   parsePositiveInt,
   pivotNarrowRowsToHelperRows as pivotNarrowRowsToHelperRowsCore,
@@ -68,6 +69,7 @@ type RunMode =
   | "obs_aqi_to_r2"
   | "source_to_r2"
   | "r2_history_obs_to_aqilevels";
+type BackfillOutputScope = "default" | "observations_only" | "aqilevels_only";
 type TriggerMode = "scheduler" | "manual";
 type SourceKind = "ingestdb" | "obs_aqidb" | "r2";
 type RunStatus = "ok" | "error" | "dry_run" | "stubbed";
@@ -271,6 +273,10 @@ type ObsHistoryFileEntry = {
   max_observed_at?: string | null;
   min_timestamp_hour_utc?: string | null;
   max_timestamp_hour_utc?: string | null;
+  // Internal-only: per-part counts used to compute the connector-level
+  // top-level `timeseries_row_counts` aggregate. Stripped from the
+  // serialized manifest by stripTimeseriesCountsFromFileEntries.
+  timeseries_row_counts?: Record<string, number> | null;
 };
 
 type ObsConnectorManifest = {
@@ -571,6 +577,13 @@ const TRIGGER_MODE = parseTriggerMode(
   "manual",
 ) as TriggerMode;
 const DRY_RUN = parseBooleanish(Deno.env.get("UK_AQ_BACKFILL_DRY_RUN"), false);
+const BACKFILL_OUTPUT_SCOPE_RAW = (
+  Deno.env.get("UK_AQ_BACKFILL_OUTPUT_SCOPE") || ""
+).trim().toLowerCase();
+const BACKFILL_OUTPUT_SCOPE = parseBackfillOutputScope(
+  BACKFILL_OUTPUT_SCOPE_RAW,
+  "default",
+) as BackfillOutputScope;
 const FORCE_REPLACE = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_FORCE_REPLACE"),
   false,
@@ -952,6 +965,7 @@ function logStructured(
     event,
     timestamp: nowIso(),
     run_mode: RUN_MODE,
+    output_scope: BACKFILL_OUTPUT_SCOPE,
     trigger_mode: TRIGGER_MODE,
     ...details,
   };
@@ -965,6 +979,38 @@ function logStructured(
     return;
   }
   console.log(line);
+}
+
+function validateRunModeOutputScope(): void {
+  if (
+    BACKFILL_OUTPUT_SCOPE_RAW &&
+    BACKFILL_OUTPUT_SCOPE_RAW !== "default" &&
+    BACKFILL_OUTPUT_SCOPE_RAW !== "observations_only" &&
+    BACKFILL_OUTPUT_SCOPE_RAW !== "aqilevels_only"
+  ) {
+    throw new Error(
+      `Invalid UK_AQ_BACKFILL_OUTPUT_SCOPE value: ${BACKFILL_OUTPUT_SCOPE_RAW}. Allowed: default, observations_only, aqilevels_only.`,
+    );
+  }
+  if (BACKFILL_OUTPUT_SCOPE === "default") {
+    return;
+  }
+  if (
+    BACKFILL_OUTPUT_SCOPE === "observations_only" &&
+    RUN_MODE !== "source_to_r2"
+  ) {
+    throw new Error(
+      `Invalid output scope combination: UK_AQ_BACKFILL_OUTPUT_SCOPE=${BACKFILL_OUTPUT_SCOPE} requires UK_AQ_BACKFILL_RUN_MODE=source_to_r2.`,
+    );
+  }
+  if (
+    BACKFILL_OUTPUT_SCOPE === "aqilevels_only" &&
+    RUN_MODE !== "r2_history_obs_to_aqilevels"
+  ) {
+    throw new Error(
+      `Invalid output scope combination: UK_AQ_BACKFILL_OUTPUT_SCOPE=${BACKFILL_OUTPUT_SCOPE} requires UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels.`,
+    );
+  }
 }
 
 function requiredEnv(name: string): string {
@@ -2007,6 +2053,31 @@ function averageNumber(total: number, count: number): number | null {
   return total / count;
 }
 
+function aggregateTimeseriesRowCounts(
+  entries: Array<{ timeseries_row_counts?: Record<string, number> | null | undefined }>,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const entry of entries) {
+    const counts = entry?.timeseries_row_counts;
+    if (!counts || typeof counts !== "object") continue;
+    for (const [key, value] of Object.entries(counts)) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric) || numeric < 0) continue;
+      out[key] = (out[key] || 0) + Math.trunc(numeric);
+    }
+  }
+  return out;
+}
+
+function stripTimeseriesCountsFromFileEntries(
+  entries: ObsHistoryFileEntry[],
+): ObsHistoryFileEntry[] {
+  return entries.map((entry) => {
+    const { timeseries_row_counts: _ignored, ...rest } = entry;
+    return rest;
+  });
+}
+
 function statsFromFileEntries(
   fileEntries: ObsHistoryFileEntry[],
   totalRows: number,
@@ -2045,11 +2116,13 @@ function summarizeObservationPartRows(
   max_timeseries_id: number | null;
   min_observed_at: string | null;
   max_observed_at: string | null;
+  timeseries_row_counts: Record<string, number>;
 } {
   let minTimeseriesId: number | null = null;
   let maxTimeseriesId: number | null = null;
   let minObservedAt: string | null = null;
   let maxObservedAt: string | null = null;
+  const timeseriesRowCounts: Record<string, number> = {};
 
   for (const row of rows) {
     const timeseriesId = Number(row.timeseries_id);
@@ -2061,6 +2134,8 @@ function summarizeObservationPartRows(
       if (maxTimeseriesId === null || normalizedTimeseriesId > maxTimeseriesId) {
         maxTimeseriesId = normalizedTimeseriesId;
       }
+      const key = String(normalizedTimeseriesId);
+      timeseriesRowCounts[key] = (timeseriesRowCounts[key] || 0) + 1;
     }
 
     const observedAt = typeof row.observed_at === "string" ? row.observed_at : null;
@@ -2079,6 +2154,7 @@ function summarizeObservationPartRows(
     max_timeseries_id: maxTimeseriesId,
     min_observed_at: minObservedAt,
     max_observed_at: maxObservedAt,
+    timeseries_row_counts: timeseriesRowCounts,
   };
 }
 
@@ -2157,12 +2233,14 @@ function createObsConnectorManifest(args: {
   writerGitSha: string | null;
   backedUpAtUtc: string;
 }): ObsConnectorManifest & { [key: string]: unknown } {
-  const parquetObjectKeys = args.fileEntries.map((entry) => entry.key);
-  const totalBytes = args.fileEntries.reduce(
+  const manifestFileEntries = stripTimeseriesCountsFromFileEntries(args.fileEntries);
+  const parquetObjectKeys = manifestFileEntries.map((entry) => entry.key);
+  const totalBytes = manifestFileEntries.reduce(
     (sum, entry) => sum + Number(entry.bytes || 0),
     0,
   );
-  const stats = statsFromFileEntries(args.fileEntries, args.sourceRowCount);
+  const stats = statsFromFileEntries(manifestFileEntries, args.sourceRowCount);
+  const timeseriesRowCounts = aggregateTimeseriesRowCounts(args.fileEntries);
 
   return withManifestHash({
     day_utc: args.dayUtc,
@@ -2173,15 +2251,16 @@ function createObsConnectorManifest(args: {
     min_observed_at: args.minObservedAt,
     max_observed_at: args.maxObservedAt,
     parquet_object_keys: parquetObjectKeys,
-    file_count: args.fileEntries.length,
+    file_count: manifestFileEntries.length,
     total_bytes: totalBytes,
-    files: args.fileEntries,
+    files: manifestFileEntries,
     history_schema_name: HISTORY_OBSERVATIONS_SCHEMA_NAME,
     history_schema_version: HISTORY_OBSERVATIONS_SCHEMA_VERSION,
     columns: HISTORY_OBSERVATIONS_COLUMNS,
     writer_version: HISTORY_OBSERVATIONS_WRITER_VERSION,
     writer_git_sha: args.writerGitSha,
     ...stats,
+    timeseries_row_counts: timeseriesRowCounts,
     backed_up_at_utc: args.backedUpAtUtc,
   });
 }
@@ -2250,6 +2329,10 @@ function createObsDayManifest(args: {
     totalRows,
   );
 
+  const timeseriesRowCounts = aggregateTimeseriesRowCounts(
+    args.connectorManifests as Array<{ timeseries_row_counts?: Record<string, number> | null }>,
+  );
+
   return withManifestHash({
     day_utc: args.dayUtc,
     connector_id: null,
@@ -2262,6 +2345,7 @@ function createObsDayManifest(args: {
     file_count: files.length,
     total_bytes: totalBytes,
     files,
+    timeseries_row_counts: timeseriesRowCounts,
     connector_manifests: args.connectorManifests.map((manifest) => ({
       connector_id: manifest.connector_id,
       manifest_key: manifest.manifest_key,
@@ -2791,6 +2875,7 @@ async function exportObsConnectorDayToR2(args: {
       max_timeseries_id: partSummary.max_timeseries_id,
       min_observed_at: partSummary.min_observed_at,
       max_observed_at: partSummary.max_observed_at,
+      timeseries_row_counts: partSummary.timeseries_row_counts,
     });
     partIndex += 1;
   };
@@ -9808,6 +9893,7 @@ async function runSourceToAll(
   if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
     throw new Error("source_to_r2 requires CFLARE_R2_* or R2_* credentials.");
   }
+  const sourceObservationsOnly = BACKFILL_OUTPUT_SCOPE === "observations_only";
 
   const retentionWindow = computeRollingLocalRetentionWindow({
     nowUtc: new Date(),
@@ -10036,6 +10122,7 @@ async function runSourceToAll(
         const sourceCheckpointJson: Record<string, unknown> = {
           source_adapter: sourceAdapter,
         };
+        let openaqFetchErrorCount = 0;
         let candidateSourceUnits = 0;
 
         if (sourceAdapter === "breathelondon") {
@@ -10400,6 +10487,7 @@ async function runSourceToAll(
                 checkpoint_json: {
                   source_adapter: sourceAdapter,
                   skip_reason: "no_matching_requested_timeseries_ids",
+                  no_data_classification: "metadata_mismatch",
                   requested_timeseries_ids: REQUESTED_TIMESERIES_IDS,
                 },
                 started_at: startedAt,
@@ -10442,6 +10530,7 @@ async function runSourceToAll(
                   source_adapter: sourceAdapter,
                   skip_reason:
                     "no_matching_location_ids_after_timeseries_filter",
+                  no_data_classification: "metadata_mismatch",
                   requested_timeseries_ids: targetedTimeseriesIds,
                   requested_timeseries_station_ref_count:
                     targetedStationRefs.size,
@@ -10462,6 +10551,9 @@ async function runSourceToAll(
           let totalSkippedUnknownParameter = 0;
           let totalSkippedOutsideDay = 0;
           let totalSkippedInvalidValueOrTimestamp = 0;
+          // fetchOpenaqArchiveCsvGz currently returns found:true/false or throws.
+          // It does not currently return structured non-throwing error results.
+          let locationFetchErrorCount = 0;
 
           for (const locationId of candidateLocationIds) {
             const sourceFile = await fetchOpenaqArchiveCsvGz(
@@ -10531,26 +10623,34 @@ async function runSourceToAll(
           }
 
           if (locationFilesFound === 0) {
-            connectorDaySkipped += 1;
-            await ledgerInsertRunDay(ledgerEnabled, {
+            const noDataClassification = locationFetchErrorCount === 0
+              ? "authoritative_no_data"
+              : "transport_error";
+            sourceCheckpointJson.no_data_classification = noDataClassification;
+            sourceCheckpointJson.fetch_outcomes = {
+              found: locationFilesFound,
+              missing: locationFilesMissing,
+              error: locationFetchErrorCount,
+            };
+            logStructured("info", "source_to_r2_openaq_no_data_classification", {
               run_id: runId,
-              run_mode: RUN_MODE,
               day_utc: dayUtc,
               connector_id: connectorId,
-              source_kind: "download",
-              status: "skipped",
-              rows_read: 0,
-              rows_written_aqilevels: 0,
-              objects_written_r2: 0,
-              checkpoint_json: {
-                source_adapter: sourceAdapter,
-                skip_reason: "no_location_day_source_files",
-                candidate_location_count: candidateLocationIds.length,
-              },
-              started_at: startedAt,
-              finished_at: nowIso(),
+              source_adapter: sourceAdapter,
+              class: noDataClassification,
+              fetch_outcomes: sourceCheckpointJson.fetch_outcomes,
+              reason: "no_location_day_source_files",
             });
-            continue;
+            sourceCheckpointJson.empty_manifest_written = true;
+            sourceCheckpointJson.empty_manifest_reason =
+              "no_location_day_source_files";
+            logStructured("info", "source_to_r2_openaq_empty_manifest_written", {
+              run_id: runId,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_adapter: sourceAdapter,
+              reason: "no_location_day_source_files",
+            });
           }
 
           candidateSourceUnits = locationFilesFound;
@@ -10572,6 +10672,7 @@ async function runSourceToAll(
             totalSkippedOutsideDay;
           sourceCheckpointJson.total_skipped_invalid_value_or_timestamp =
             totalSkippedInvalidValueOrTimestamp;
+          openaqFetchErrorCount = locationFetchErrorCount;
         } else if (sourceAdapter === "uk_air_sos") {
           const stationRefsLookup = await fetchStationRefsForConnector(
             connectorId,
@@ -10876,19 +10977,40 @@ async function runSourceToAll(
           );
           if (targetedTimeseriesIds.length > 0) {
             const targetedSet = new Set(targetedTimeseriesIds);
-            const localObsRows = await loadObsRowsForConnectorDayFromLocalHistory(
+            const rawLocalObsRows = await loadObsRowsForConnectorDayFromLocalHistory(
               dayUtc,
               connectorId,
             );
-            const localAqiRows = await loadAqiRowsForConnectorDayFromLocalHistory(
-              dayUtc,
-              connectorId,
-            );
-            if (!localObsRows || !localAqiRows) {
-              throw new Error(
-                `source_to_r2 targeted merge requires local Dropbox history manifests for day=${dayUtc} connector=${connectorId}`,
+            const rawLocalAqiRows = sourceObservationsOnly
+              ? null
+              : await loadAqiRowsForConnectorDayFromLocalHistory(
+                dayUtc,
+                connectorId,
+              );
+            // When no local history exists for this (day, connector), there is
+            // nothing to preserve — treat preservation as empty and write the
+            // replacement rows as a fresh manifest. Covers integrity backfills
+            // for days the original ingest missed (upstream outage, fresh
+            // historical backfill, etc.).
+            const localHistoryMissing = !rawLocalObsRows ||
+              (!sourceObservationsOnly && !rawLocalAqiRows);
+            if (localHistoryMissing) {
+              logStructured(
+                "info",
+                "source_to_r2_targeted_merge_no_local_history",
+                {
+                  run_id: runId,
+                  day_utc: dayUtc,
+                  connector_id: connectorId,
+                  source_adapter: sourceAdapter,
+                  obs_local_missing: !rawLocalObsRows,
+                  aqi_local_missing: !sourceObservationsOnly && !rawLocalAqiRows,
+                  targeted_timeseries_id_count: targetedTimeseriesIds.length,
+                },
               );
             }
+            const localObsRows = rawLocalObsRows ?? [];
+            const localAqiRows = rawLocalAqiRows;
 
             const replacementObsRows = obsHistoryRows.filter((row) =>
               targetedSet.has(row.timeseries_id)
@@ -10901,82 +11023,148 @@ async function runSourceToAll(
               ...replacementObsRows,
             ]);
 
-            const mergedSourceRows = mapR2ObservationRowsToSourceObservations({
-              rows: obsHistoryRows.map((row) => ({
-                timeseries_id: row.timeseries_id,
-                observed_at: row.observed_at,
-                value: row.value,
-              })),
-              bindingByTimeseriesId: connectorLookup.binding_by_timeseries_id,
-              windowStartIso: utcDayStartIso(dayUtc),
-              windowEndIso: utcDayStartIso(shiftIsoDay(dayUtc, 1)),
-            });
-            const replacementAqiRows = helperRowsToAqilevelHistoryRows(
-              sourceObservationRowsToHelperRowsForDay(
-                mergedSourceRows.filter((row) =>
-                  targetedSet.has(row.timeseries_id)
-                ),
-                dayUtc,
-              ),
-            );
-            const preservedAqiRows = localAqiRows.filter((row) =>
-              !targetedSet.has(row.timeseries_id)
-            );
-            aqilevelRows = dedupeAqiHistoryRows([
-              ...preservedAqiRows,
-              ...replacementAqiRows,
-            ]).map((row) => ({ ...row, connector_id: connectorId }));
-
             sourceCheckpointJson.targeted_merge = true;
             sourceCheckpointJson.targeted_timeseries_ids = targetedTimeseriesIds;
             sourceCheckpointJson.targeted_replacement_obs_rows =
               replacementObsRows.length;
             sourceCheckpointJson.targeted_preserved_obs_rows =
               preservedObsRows.length;
-            sourceCheckpointJson.targeted_replacement_aqi_rows =
-              replacementAqiRows.length;
-            sourceCheckpointJson.targeted_preserved_aqi_rows =
-              preservedAqiRows.length;
+            sourceCheckpointJson.targeted_local_history_missing =
+              localHistoryMissing;
+            if (!sourceObservationsOnly) {
+              const effectiveLocalAqiRows = localAqiRows ?? [];
+              const mergedSourceRows = mapR2ObservationRowsToSourceObservations({
+                rows: obsHistoryRows.map((row) => ({
+                  timeseries_id: row.timeseries_id,
+                  observed_at: row.observed_at,
+                  value: row.value,
+                })),
+                bindingByTimeseriesId: connectorLookup.binding_by_timeseries_id,
+                windowStartIso: utcDayStartIso(dayUtc),
+                windowEndIso: utcDayStartIso(shiftIsoDay(dayUtc, 1)),
+              });
+              const replacementAqiRows = helperRowsToAqilevelHistoryRows(
+                sourceObservationRowsToHelperRowsForDay(
+                  mergedSourceRows.filter((row) =>
+                    targetedSet.has(row.timeseries_id)
+                  ),
+                  dayUtc,
+                ),
+              );
+              const preservedAqiRows = effectiveLocalAqiRows.filter((row) =>
+                !targetedSet.has(row.timeseries_id)
+              );
+              aqilevelRows = dedupeAqiHistoryRows([
+                ...preservedAqiRows,
+                ...replacementAqiRows,
+              ]).map((row) => ({ ...row, connector_id: connectorId }));
+              sourceCheckpointJson.targeted_replacement_aqi_rows =
+                replacementAqiRows.length;
+              sourceCheckpointJson.targeted_preserved_aqi_rows =
+                preservedAqiRows.length;
+            }
           } else {
+            if (!sourceObservationsOnly) {
+              const helperRows = sourceObservationRowsToHelperRowsForDay(
+                dedupedObservationRows,
+                dayUtc,
+              );
+              aqilevelRows = helperRowsToAqilevelHistoryRows(helperRows);
+            }
+          }
+        } else {
+          if (!sourceObservationsOnly) {
             const helperRows = sourceObservationRowsToHelperRowsForDay(
               dedupedObservationRows,
               dayUtc,
             );
             aqilevelRows = helperRowsToAqilevelHistoryRows(helperRows);
           }
-        } else {
-          const helperRows = sourceObservationRowsToHelperRowsForDay(
-            dedupedObservationRows,
-            dayUtc,
-          );
-          aqilevelRows = helperRowsToAqilevelHistoryRows(helperRows);
         }
         rowsWrittenAqilevels += aqilevelRows.length;
 
-        if (obsHistoryRows.length === 0 || aqilevelRows.length === 0) {
-          connectorDaySkipped += 1;
-          await ledgerInsertRunDay(ledgerEnabled, {
+        const noObservations = obsHistoryRows.length === 0;
+        const noAqilevels = aqilevelRows.length === 0;
+        if (noObservations || (!sourceObservationsOnly && noAqilevels)) {
+          const skipReason = noObservations
+            ? "no_observation_rows"
+            : "no_observations_or_aqilevel_rows";
+          const shouldWriteOpenaqEmptyManifest = sourceAdapter === "openaq" &&
+            noObservations &&
+            sourceCheckpointJson.no_data_classification !== "transport_error";
+          if (shouldWriteOpenaqEmptyManifest) {
+            sourceCheckpointJson.no_data_classification = "authoritative_no_data";
+            sourceCheckpointJson.fetch_outcomes = sourceCheckpointJson.fetch_outcomes || {
+              found: toSafeInt(sourceCheckpointJson.location_files_found),
+              missing: toSafeInt(sourceCheckpointJson.location_files_missing),
+              error: openaqFetchErrorCount,
+            };
+            sourceCheckpointJson.empty_manifest_written = true;
+            sourceCheckpointJson.empty_manifest_reason = skipReason;
+            logStructured("info", "source_to_r2_openaq_no_data_classification", {
+              run_id: runId,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_adapter: sourceAdapter,
+              class: "authoritative_no_data",
+              fetch_outcomes: sourceCheckpointJson.fetch_outcomes,
+              reason: skipReason,
+            });
+            logStructured("info", "source_to_r2_openaq_empty_manifest_written", {
+              run_id: runId,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_adapter: sourceAdapter,
+              reason: skipReason,
+            });
+          } else {
+            connectorDaySkipped += 1;
+            logStructured("info", "source_to_r2_connector_day_skipped", {
             run_id: runId,
-            run_mode: RUN_MODE,
             day_utc: dayUtc,
             connector_id: connectorId,
-            source_kind: "download",
-            status: "skipped",
-            rows_read: obsHistoryRows.length,
-            rows_written_aqilevels: aqilevelRows.length,
-            objects_written_r2: 0,
-            checkpoint_json: {
-              source_adapter: sourceAdapter,
-              skip_reason: "no_observations_or_aqilevel_rows",
-              candidate_source_units: candidateSourceUnits,
-              rows_observations: obsHistoryRows.length,
-              rows_aqilevels: aqilevelRows.length,
-              ...sourceCheckpointJson,
-            },
-            started_at: startedAt,
-            finished_at: nowIso(),
+            source_adapter: sourceAdapter,
+            skip_reason: skipReason,
+            candidate_source_units: candidateSourceUnits,
+            rows_observations: obsHistoryRows.length,
+            rows_aqilevels: sourceObservationsOnly ? null : aqilevelRows.length,
+            targeted_merge: sourceCheckpointJson.targeted_merge ?? false,
+            targeted_timeseries_id_count:
+              Array.isArray(sourceCheckpointJson.targeted_timeseries_ids)
+                ? sourceCheckpointJson.targeted_timeseries_ids.length
+                : null,
+            targeted_replacement_obs_rows:
+              sourceCheckpointJson.targeted_replacement_obs_rows ?? null,
+            targeted_preserved_obs_rows:
+              sourceCheckpointJson.targeted_preserved_obs_rows ?? null,
+            targeted_replacement_aqi_rows:
+              sourceCheckpointJson.targeted_replacement_aqi_rows ?? null,
+            targeted_preserved_aqi_rows:
+              sourceCheckpointJson.targeted_preserved_aqi_rows ?? null,
           });
-          continue;
+            await ledgerInsertRunDay(ledgerEnabled, {
+              run_id: runId,
+              run_mode: RUN_MODE,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_kind: "download",
+              status: "skipped",
+              rows_read: obsHistoryRows.length,
+              rows_written_aqilevels: aqilevelRows.length,
+              objects_written_r2: 0,
+              checkpoint_json: {
+                source_adapter: sourceAdapter,
+                skip_reason: skipReason,
+                candidate_source_units: candidateSourceUnits,
+                rows_observations: obsHistoryRows.length,
+                rows_aqilevels: sourceObservationsOnly ? null : aqilevelRows.length,
+                ...sourceCheckpointJson,
+              },
+              started_at: startedAt,
+              finished_at: nowIso(),
+            });
+            continue;
+          }
         }
 
         if (DRY_RUN) {
@@ -10988,7 +11176,7 @@ async function runSourceToAll(
             source_adapter: sourceAdapter,
             candidate_source_units: candidateSourceUnits,
             rows_observations: obsHistoryRows.length,
-            rows_aqilevels: aqilevelRows.length,
+            rows_aqilevels: sourceObservationsOnly ? null : aqilevelRows.length,
           });
           await ledgerInsertRunDay(ledgerEnabled, {
             run_id: runId,
@@ -11004,7 +11192,7 @@ async function runSourceToAll(
               source_adapter: sourceAdapter,
               candidate_source_units: candidateSourceUnits,
               rows_observations: obsHistoryRows.length,
-              rows_aqilevels: aqilevelRows.length,
+              rows_aqilevels: sourceObservationsOnly ? null : aqilevelRows.length,
               ...sourceCheckpointJson,
             },
             started_at: startedAt,
@@ -11020,24 +11208,14 @@ async function runSourceToAll(
           connector_id: connectorId,
           rows: obsHistoryRows,
         });
-        const aqiExport = await exportAqiConnectorRowsToR2({
-          run_id: runId,
-          day_utc: dayUtc,
-          connector_id: connectorId,
-          rows: aqilevelRows,
-        });
-        objectsWrittenR2 += obsExport.objects_written_r2 +
-          aqiExport.objects_written_r2;
+        objectsWrittenR2 += obsExport.objects_written_r2;
 
         const obsConnectorManifests = await loadAllObsConnectorManifestsForDay(
           dayUtc,
         );
-        const aqiConnectorManifests = await loadAllAqiConnectorManifestsForDay(
-          dayUtc,
-        );
-        if (!obsConnectorManifests.length || !aqiConnectorManifests.length) {
+        if (!obsConnectorManifests.length) {
           throw new Error(
-            `missing connector manifests for day=${dayUtc} after source_to_r2 export`,
+            `missing observation connector manifests for day=${dayUtc} after source_to_r2 export`,
           );
         }
         const obsDayManifest = createObsDayManifest({
@@ -11047,26 +11225,47 @@ async function runSourceToAll(
           writerGitSha: OBS_R2_WRITER_GIT_SHA,
           backedUpAtUtc: nowIso(),
         });
-        const aqiDayManifest = createAqiDayManifest({
-          dayUtc,
-          runId,
-          connectorManifests: aqiConnectorManifests,
-          writerGitSha: OBS_R2_WRITER_GIT_SHA,
-          backedUpAtUtc: nowIso(),
-        });
+        let aqiExport:
+          | { objects_written_r2: number; manifest_key: string }
+          | null = null;
+        if (!sourceObservationsOnly) {
+          aqiExport = await exportAqiConnectorRowsToR2({
+            run_id: runId,
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            rows: aqilevelRows,
+          });
+          objectsWrittenR2 += aqiExport.objects_written_r2;
+          const aqiConnectorManifests = await loadAllAqiConnectorManifestsForDay(
+            dayUtc,
+          );
+          if (!aqiConnectorManifests.length) {
+            throw new Error(
+              `missing AQI connector manifests for day=${dayUtc} after source_to_r2 export`,
+            );
+          }
+          const aqiDayManifest = createAqiDayManifest({
+            dayUtc,
+            runId,
+            connectorManifests: aqiConnectorManifests,
+            writerGitSha: OBS_R2_WRITER_GIT_SHA,
+            backedUpAtUtc: nowIso(),
+          });
+          await r2PutObject({
+            r2: OBS_R2_CONFIG,
+            key: buildAqiDayManifestKey(dayUtc),
+            body: encodeJsonBody(aqiDayManifest),
+            content_type: "application/json",
+          });
+          objectsWrittenR2 += 1;
+        }
         await r2PutObject({
           r2: OBS_R2_CONFIG,
           key: buildObsDayManifestKey(dayUtc),
           body: encodeJsonBody(obsDayManifest),
           content_type: "application/json",
         });
-        await r2PutObject({
-          r2: OBS_R2_CONFIG,
-          key: buildAqiDayManifestKey(dayUtc),
-          body: encodeJsonBody(aqiDayManifest),
-          content_type: "application/json",
-        });
-        objectsWrittenR2 += 2;
+        objectsWrittenR2 += 1;
         connectorDayComplete += 1;
         sourceProcessedDaySet.add(dayUtc);
         logStructured("info", "source_to_r2_connector_day_complete", {
@@ -11076,9 +11275,11 @@ async function runSourceToAll(
           source_adapter: sourceAdapter,
           candidate_source_units: candidateSourceUnits,
           rows_observations: obsHistoryRows.length,
-          rows_aqilevels: aqilevelRows.length,
-          objects_written_r2: obsExport.objects_written_r2 +
-            aqiExport.objects_written_r2 + 2,
+          rows_aqilevels: sourceObservationsOnly ? null : aqilevelRows.length,
+          objects_written_r2: sourceObservationsOnly
+            ? obsExport.objects_written_r2 + 1
+            : obsExport.objects_written_r2 +
+              (aqiExport?.objects_written_r2 || 0) + 2,
         });
 
         await ledgerInsertRunDay(ledgerEnabled, {
@@ -11089,15 +11290,19 @@ async function runSourceToAll(
           source_kind: "download",
           status: "complete",
           rows_read: obsHistoryRows.length,
-          rows_written_aqilevels: aqilevelRows.length,
-          objects_written_r2: obsExport.objects_written_r2 +
-            aqiExport.objects_written_r2 + 2,
+          rows_written_aqilevels: sourceObservationsOnly ? 0 : aqilevelRows.length,
+          objects_written_r2: sourceObservationsOnly
+            ? obsExport.objects_written_r2 + 1
+            : obsExport.objects_written_r2 +
+              (aqiExport?.objects_written_r2 || 0) + 2,
           checkpoint_json: {
             source_adapter: sourceAdapter,
             observation_manifest_key: obsExport.manifest_key,
-            aqilevels_manifest_key: aqiExport.manifest_key,
+            aqilevels_manifest_key: aqiExport?.manifest_key || null,
             day_observation_manifest_key: buildObsDayManifestKey(dayUtc),
-            day_aqilevels_manifest_key: buildAqiDayManifestKey(dayUtc),
+            day_aqilevels_manifest_key: sourceObservationsOnly
+              ? null
+              : buildAqiDayManifestKey(dayUtc),
             candidate_source_units: candidateSourceUnits,
             ...sourceCheckpointJson,
           },
@@ -11111,13 +11316,15 @@ async function runSourceToAll(
           source_kind: "download",
           status: "complete",
           rows_read: obsHistoryRows.length,
-          rows_written_aqilevels: aqilevelRows.length,
-          objects_written_r2: obsExport.objects_written_r2 +
-            aqiExport.objects_written_r2 + 2,
+          rows_written_aqilevels: sourceObservationsOnly ? 0 : aqilevelRows.length,
+          objects_written_r2: sourceObservationsOnly
+            ? obsExport.objects_written_r2 + 1
+            : obsExport.objects_written_r2 +
+              (aqiExport?.objects_written_r2 || 0) + 2,
           checkpoint_json: {
             source_adapter: sourceAdapter,
             observation_manifest_key: obsExport.manifest_key,
-            aqilevels_manifest_key: aqiExport.manifest_key,
+            aqilevels_manifest_key: aqiExport?.manifest_key || null,
             updated_by_run_id: runId,
             completed_at: nowIso(),
             candidate_source_units: candidateSourceUnits,
@@ -11267,6 +11474,7 @@ async function runSourceToAll(
 async function main(): Promise<void> {
   const runId = crypto.randomUUID();
   const startedAtMs = Date.now();
+  validateRunModeOutputScope();
   resetRunCaches();
   const window = resolveRunWindow();
   await resolveRequestedStationFilters();
@@ -11281,6 +11489,7 @@ async function main(): Promise<void> {
     run_mode: RUN_MODE,
     trigger_mode: TRIGGER_MODE,
     dry_run: DRY_RUN,
+    output_scope: BACKFILL_OUTPUT_SCOPE,
     force_replace: FORCE_REPLACE,
     enable_r2_fallback: ENABLE_R2_FALLBACK,
     from_day_utc: window.from_day_utc,
@@ -11395,6 +11604,7 @@ async function main(): Promise<void> {
       unresolved_station_ids: unresolvedRequestedStationIds,
       enable_r2_fallback: ENABLE_R2_FALLBACK,
       allow_stub_modes: ALLOW_STUB_MODES,
+      output_scope: BACKFILL_OUTPUT_SCOPE,
     },
     error_json: errorMessage ? { message: errorMessage } : null,
     finished_at: nowIso(),
@@ -11406,6 +11616,7 @@ async function main(): Promise<void> {
     run_mode: RUN_MODE,
     trigger_mode: TRIGGER_MODE,
     dry_run: DRY_RUN,
+    output_scope: BACKFILL_OUTPUT_SCOPE,
     force_replace: FORCE_REPLACE,
     connector_ids: effectiveConnectorIds,
     connector_ids_requested: CONNECTOR_IDS,
