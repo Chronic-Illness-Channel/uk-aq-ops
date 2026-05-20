@@ -2,19 +2,6 @@ name = "uk-aq-workflow-scheduler"
 main = "worker.js"
 compatibility_date = "2026-05-13"
 
-[observability]
-enabled = false
-head_sampling_rate = 1
-
-[observability.logs]
-enabled = true
-head_sampling_rate = 1
-invocation_logs = true
-
-[observability.traces]
-enabled = false
-head_sampling_rate = 1
-
 # Single schedule source of truth.
 # Edit only these cron lines when changing run times.
 # Format: "<cron>", # job_key: <job_key> | <repo>/<workflow_file>

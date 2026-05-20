@@ -84,6 +84,7 @@ R2_HISTORY_DAYS_API_MAX_DAYS = max(1, min(3660, _raw_r2_history_days_max))
 OBS_AQIDB_SUPABASE_URL = str(os.getenv("OBS_AQIDB_SUPABASE_URL") or "").strip()
 OBS_AQIDB_SECRET_KEY = str(os.getenv("OBS_AQIDB_SECRET_KEY") or "").strip()
 PUBLIC_SCHEMA = os.getenv("UK_AQ_PUBLIC_SCHEMA", "uk_aq_public")
+OPS_SCHEMA = os.getenv("UK_AQ_OPS_SCHEMA", "uk_aq_ops")
 R2_BACKUP_WINDOW_RPC = os.getenv("UK_AQ_R2_HISTORY_WINDOW_RPC", "uk_aq_rpc_r2_history_window")
 UK_AQ_DROPBOX_ROOT = str(os.getenv("UK_AQ_DROPBOX_ROOT") or "CIC-Test").strip()
 UK_AQ_DROPBOX_LOCAL_ROOT = str(os.getenv("UK_AQ_DROPBOX_LOCAL_ROOT") or "").strip()
@@ -133,6 +134,11 @@ R2_HISTORY_DAYS_CACHE_STATE: Dict[str, Any] = {
     "generated_at": None,
 }
 STORAGE_COVERAGE_CACHE_STATE: Dict[str, Any] = {"rows": None, "next_refresh_at": None}
+DROPBOX_HISTORY_MTIME_CACHE_STATE: Dict[str, Any] = {
+    "payload": None,
+    "error": None,
+    "generated_at": None,
+}
 DISPATCH_RUNS_STATE: Dict[str, Any] = {
     "rows": [],
     "latest_created_at": None,
@@ -141,6 +147,14 @@ CACHE_TTL_SECONDS = 20
 R2_CACHE_TTL_SECONDS = 60 * 60
 R2_HISTORY_DAYS_CACHE_TTL_SECONDS = 5 * 60
 STORAGE_COVERAGE_CACHE_TTL_SECONDS = 6 * 60 * 60
+DROPBOX_HISTORY_MTIME_CACHE_TTL_SECONDS = max(
+    5,
+    int(os.getenv("UK_AQ_DROPBOX_MTIME_CACHE_TTL_SECONDS", "20")),
+)
+DAILY_TASK_RUNS_DASHBOARD_MAX_ROWS = max(
+    50,
+    int(os.getenv("UK_AQ_DAILY_TASK_RUNS_DASHBOARD_MAX_ROWS", "500")),
+)
 UTC_DATETIME_MIN = datetime.min.replace(tzinfo=timezone.utc)
 R2_BYTES_PER_GB = 1024 ** 3
 R2_CLASS_A_ACTION_TYPES = {
@@ -1487,6 +1501,77 @@ def _parse_iso_day(value: Any) -> Optional[date]:
         return None
 
 
+def _fetch_daily_task_runs_dashboard_rows(
+    *,
+    scheduled_day: date,
+    mode: str,
+) -> List[Dict[str, Any]]:
+    if mode not in {"latest", "all"}:
+        raise ValueError("mode must be latest or all")
+    if not OBS_AQIDB_SUPABASE_URL or not OBS_AQIDB_SECRET_KEY:
+        raise RuntimeError(
+            "ObsAQIDB is not configured (set OBS_AQIDB_SUPABASE_URL and OBS_AQIDB_SECRET_KEY)."
+        )
+
+    base_url = _ensure_allowed_base_url(
+        f"{OBS_AQIDB_SUPABASE_URL.rstrip('/')}/rest/v1"
+    )
+    headers = _postgrest_headers(OBS_AQIDB_SECRET_KEY, schema=OPS_SCHEMA)
+    params: Dict[str, str] = {
+        "select": (
+            "run_id,task_key,task_name,platform,source,scheduled_for_date,scheduled_time_utc,"
+            "scheduled_at_utc,attempt,raw_status,started_at,finished_at,failed_at,updated_at,"
+            "duration_seconds,summary,error_message,log_url,effective_status,scheduled_or_started_at,"
+            "finished_or_failed_at,is_failed,is_overdue,is_not_started,task_day_rank"
+        ),
+        "scheduled_for_date": f"eq.{scheduled_day.isoformat()}",
+        "order": "updated_at.desc.nullslast,run_id.desc",
+        "limit": str(DAILY_TASK_RUNS_DASHBOARD_MAX_ROWS),
+    }
+    if mode == "latest":
+        params["task_day_rank"] = "eq.1"
+
+    rows = _fetch_json(
+        f"{base_url}/daily_task_runs_dashboard",
+        headers,
+        params,
+    )
+    normalized_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        normalized_rows.append(
+            {
+                "run_id": row.get("run_id"),
+                "task_key": row.get("task_key"),
+                "task_name": row.get("task_name"),
+                "platform": row.get("platform"),
+                "source": row.get("source"),
+                "scheduled_for_date": row.get("scheduled_for_date"),
+                "scheduled_time_utc": row.get("scheduled_time_utc"),
+                "scheduled_at_utc": row.get("scheduled_at_utc"),
+                "attempt": row.get("attempt"),
+                "raw_status": row.get("raw_status"),
+                "started_at": row.get("started_at"),
+                "finished_at": row.get("finished_at"),
+                "failed_at": row.get("failed_at"),
+                "updated_at": row.get("updated_at"),
+                "duration_seconds": row.get("duration_seconds"),
+                "summary": row.get("summary"),
+                "error_message": row.get("error_message"),
+                "log_url": row.get("log_url"),
+                "effective_status": row.get("effective_status"),
+                "scheduled_or_started_at": row.get("scheduled_or_started_at"),
+                "finished_or_failed_at": row.get("finished_or_failed_at"),
+                "is_failed": row.get("is_failed"),
+                "is_overdue": row.get("is_overdue"),
+                "is_not_started": row.get("is_not_started"),
+                "task_day_rank": row.get("task_day_rank"),
+            }
+        )
+    return normalized_rows
+
+
 def _empty_dropbox_backup_days() -> Dict[str, Set[date]]:
     return {
         "observations": set(),
@@ -1678,6 +1763,163 @@ def _candidate_dropbox_state_paths() -> List[Path]:
             add_from_base(app_dir)
 
     return candidates
+
+
+def _candidate_dropbox_history_dirs() -> List[Path]:
+    candidates: List[Path] = []
+    seen: Set[str] = set()
+
+    def add_candidate(raw_path: Optional[Path]) -> None:
+        if raw_path is None:
+            return
+        expanded = raw_path.expanduser()
+        key = str(expanded)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(expanded)
+
+    for state_path in _candidate_dropbox_state_paths():
+        rel_parts = [
+            part for part in str(UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH or "").strip().strip("/").split("/")
+            if part
+        ]
+        history_path = state_path
+        for _ in rel_parts:
+            history_path = history_path.parent
+        if not rel_parts:
+            history_path = state_path.parent
+        add_candidate(history_path)
+
+    local_roots: List[Path] = []
+    if UK_AQ_DROPBOX_LOCAL_ROOT:
+        local_roots.append(Path(UK_AQ_DROPBOX_LOCAL_ROOT))
+    default_local_root = Path.home() / "Dropbox"
+    if default_local_root.exists():
+        local_roots.append(default_local_root)
+
+    remote_root = UK_AQ_DROPBOX_ROOT.strip().strip("/")
+    history_dir = UK_AQ_R2_HISTORY_DROPBOX_DIR.strip().strip("/")
+
+    def add_from_base(base_root: Path) -> None:
+        path_parts: List[str] = [str(base_root)]
+        if remote_root:
+            path_parts.append(remote_root)
+        if history_dir:
+            path_parts.append(history_dir)
+        add_candidate(Path(*path_parts))
+
+    for local_root in local_roots:
+        add_from_base(local_root)
+        apps_root = local_root / "Apps"
+        if UK_AQ_DROPBOX_APP_FOLDER:
+            add_from_base(apps_root / UK_AQ_DROPBOX_APP_FOLDER)
+            continue
+        if not apps_root.is_dir():
+            continue
+        preferred_app_path = apps_root / "github-uk-air-quality-networks"
+        if preferred_app_path.is_dir():
+            add_from_base(preferred_app_path)
+        try:
+            app_dirs = sorted(
+                child
+                for child in apps_root.iterdir()
+                if child.is_dir() and child != preferred_app_path
+            )
+        except OSError:
+            app_dirs = []
+        for app_dir in app_dirs:
+            add_from_base(app_dir)
+
+    return candidates
+
+
+def _scan_dropbox_history_latest_mtime() -> Tuple[Dict[str, Any], Optional[str]]:
+    now_utc = datetime.now(timezone.utc)
+    newest_mtime: Optional[float] = None
+    newest_path: Optional[Path] = None
+    newest_root: Optional[Path] = None
+    existing_roots: List[Path] = []
+    candidate_roots = _candidate_dropbox_history_dirs()
+
+    for root in candidate_roots:
+        if not root.is_dir():
+            continue
+        existing_roots.append(root)
+        try:
+            root_mtime = root.stat().st_mtime
+        except OSError:
+            root_mtime = None
+        if root_mtime is not None and (newest_mtime is None or root_mtime > newest_mtime):
+            newest_mtime = root_mtime
+            newest_path = root
+            newest_root = root
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            for dirname in dirnames:
+                dir_candidate = Path(dirpath) / dirname
+                try:
+                    mtime = dir_candidate.stat().st_mtime
+                except OSError:
+                    continue
+                if newest_mtime is None or mtime > newest_mtime:
+                    newest_mtime = mtime
+                    newest_path = dir_candidate
+                    newest_root = root
+            for filename in filenames:
+                file_candidate = Path(dirpath) / filename
+                try:
+                    mtime = file_candidate.stat().st_mtime
+                except OSError:
+                    continue
+                if newest_mtime is None or mtime > newest_mtime:
+                    newest_mtime = mtime
+                    newest_path = file_candidate
+                    newest_root = root
+
+    if newest_mtime is None:
+        payload = {
+            "generated_at": now_utc.isoformat().replace("+00:00", "Z"),
+            "resolved_history_path": str(existing_roots[0]) if existing_roots else None,
+            "candidate_history_paths": [str(path) for path in candidate_roots[:12]],
+            "latest_mtime_utc": None,
+            "latest_entry_path": None,
+        }
+        return payload, "No readable files/directories found under candidate R2_history_backup paths"
+
+    latest_mtime = datetime.fromtimestamp(newest_mtime, tz=timezone.utc)
+    payload = {
+        "generated_at": now_utc.isoformat().replace("+00:00", "Z"),
+        "resolved_history_path": str(newest_root) if newest_root else None,
+        "candidate_history_paths": [str(path) for path in candidate_roots[:12]],
+        "latest_mtime_utc": latest_mtime.isoformat().replace("+00:00", "Z"),
+        "latest_entry_path": str(newest_path) if newest_path else None,
+    }
+    return payload, None
+
+
+def _get_dropbox_history_latest_mtime_cached(
+    force_refresh: bool = False,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    now_utc = datetime.now(timezone.utc)
+    with CACHE_LOCK:
+        cached_payload = DROPBOX_HISTORY_MTIME_CACHE_STATE.get("payload")
+        cached_error = DROPBOX_HISTORY_MTIME_CACHE_STATE.get("error")
+        cached_generated_at = DROPBOX_HISTORY_MTIME_CACHE_STATE.get("generated_at")
+        if (
+            not force_refresh
+            and isinstance(cached_payload, dict)
+            and isinstance(cached_generated_at, datetime)
+            and (now_utc - cached_generated_at).total_seconds() < DROPBOX_HISTORY_MTIME_CACHE_TTL_SECONDS
+        ):
+            return cached_payload, str(cached_error) if cached_error else None
+
+    payload, error = _scan_dropbox_history_latest_mtime()
+    with CACHE_LOCK:
+        DROPBOX_HISTORY_MTIME_CACHE_STATE["payload"] = payload
+        DROPBOX_HISTORY_MTIME_CACHE_STATE["error"] = error
+        DROPBOX_HISTORY_MTIME_CACHE_STATE["generated_at"] = now_utc
+    return payload, error
 
 
 def _load_dropbox_backup_days() -> Tuple[Dict[str, Set[date]], Optional[str], Optional[str]]:
@@ -3474,6 +3716,7 @@ def _build_dashboard(
 ) -> Dict[str, Any]:
     headers = _postgrest_headers(service_role_key)
     project_ref = _project_ref_from_base_url(base_url)
+    obs_aqidb_project_ref = _project_ref_from_base_url(OBS_AQIDB_SUPABASE_URL)
 
     connectors = _fetch_all(
         base_url,
@@ -3761,6 +4004,7 @@ def _build_dashboard(
 
     return {
         "project_ref": project_ref,
+        "obs_aqidb_project_ref": obs_aqidb_project_ref,
         "generated_at": now.isoformat().replace("+00:00", "Z"),
         "dispatch_cursor": next_dispatch_cursor,
         "buckets": list(BUCKETS),
@@ -3915,6 +4159,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/r2_connector_counts":
                 self._serve_r2_connector_counts(parsed)
+                return
+            if parsed.path == "/api/operations_dropbox_mtime":
+                self._serve_operations_dropbox_mtime(parsed)
+                return
+            if parsed.path == "/api/daily_task_runs":
+                self._serve_daily_task_runs(parsed)
                 return
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
         except Exception as exc:
@@ -4258,6 +4508,76 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         payload = json.dumps(payload_data, indent=2)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(payload.encode("utf-8"))
+
+    def _serve_operations_dropbox_mtime(self, parsed) -> None:
+        query = parse_qs(parsed.query, keep_blank_values=False)
+        force_refresh_raw = ((query.get("force") or [""])[0] or "").strip().lower()
+        force_refresh = force_refresh_raw in {"1", "true", "yes", "y", "on"}
+        payload_obj, payload_error = _get_dropbox_history_latest_mtime_cached(
+            force_refresh=force_refresh,
+        )
+        payload_data = dict(payload_obj or {})
+        payload_data["error"] = payload_error
+        payload_data["generated_at"] = payload_data.get(
+            "generated_at",
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+        payload = json.dumps(payload_data, indent=2)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(payload.encode("utf-8"))
+
+    def _serve_daily_task_runs(self, parsed) -> None:
+        query = parse_qs(parsed.query, keep_blank_values=False)
+        mode = ((query.get("mode") or ["latest"])[0] or "latest").strip().lower()
+        day_text = ((query.get("day") or [""])[0] or "").strip()
+        selected_day = _parse_iso_day(day_text) if day_text else None
+        if selected_day is None:
+            selected_day = datetime.now(timezone.utc).date()
+
+        if mode not in {"latest", "all"}:
+            payload = json.dumps({"error": "mode must be latest or all"}, indent=2)
+            self.send_response(HTTPStatus.BAD_REQUEST)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload.encode("utf-8"))
+            return
+
+        try:
+            rows = _fetch_daily_task_runs_dashboard_rows(
+                scheduled_day=selected_day,
+                mode=mode,
+            )
+        except Exception as exc:
+            payload = json.dumps({"error": str(exc)}, indent=2)
+            self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload.encode("utf-8"))
+            return
+
+        payload = json.dumps(
+            {
+                "day": selected_day.isoformat(),
+                "mode": mode,
+                "rows": rows,
+                "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            },
+            indent=2,
+        )
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")

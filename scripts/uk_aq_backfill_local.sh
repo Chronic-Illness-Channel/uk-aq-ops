@@ -26,12 +26,14 @@ Optional env vars:
   UK_AQ_BACKFILL_TIMESERIES_IDS             optional CSV timeseries filter
   UK_AQ_BACKFILL_TIMESERIES_ID              optional single timeseries filter alias
   UK_AQ_BACKFILL_OUTPUT_SCOPE               default|observations_only|aqilevels_only (default: default)
-  UK_AQ_BACKFILL_LOCAL_LOG_DIR              default: /Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/$UK_AQ_DROPBOX_ROOT/uk-aq-backfill-local-logs
+  UK_AQ_BACKFILL_LOCAL_LOG_DIR              default: /Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/$UK_AQ_ENV_NAME/uk-aq-backfill-local-logs
   UK_AQ_BACKFILL_LOCAL_STOP_ON_ERROR        default: true
   UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS       default: 0
   UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE        default: 0 (disabled)
   UK_AQ_BACKFILL_MAX_RUNS_PER_HOUR          default: 0 (disabled)
   UK_AQ_BACKFILL_PAUSE_SECONDS              legacy alias for run interval
+  UK_AQ_BACKFILL_DENO_BIN                   optional full path override for deno binary
+  UK_AQ_BACKFILL_NODE_BIN                   optional full path override for node binary
 
 Notes:
   - This script is local/manual-only and always sets UK_AQ_BACKFILL_TRIGGER_MODE=manual.
@@ -52,15 +54,19 @@ trim() {
 
 build_default_log_dir() {
   local env_root
-  env_root="$(trim "${UK_AQ_DROPBOX_ROOT:-}")"
+  env_root="$(trim "${UK_AQ_ENV_NAME:-}")"
+  if [[ -z "${env_root}" ]]; then
+    env_root="$(trim "${UK_AQ_DROPBOX_ROOT:-}")"
+  fi
   while [[ "${env_root}" == /* ]]; do
     env_root="${env_root#/}"
   done
   while [[ "${env_root}" == */ ]]; do
     env_root="${env_root%/}"
   done
+
   if [[ -z "${env_root}" ]]; then
-    env_root="CIC-Test"
+    env_root="local"
   fi
   printf '/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/%s/uk-aq-backfill-local-logs' "${env_root}"
 }
@@ -178,6 +184,76 @@ resolve_run_job_path() {
   fi
   printf '%s' "${active_runner}"
   return 0
+}
+
+resolve_deno_bin() {
+  local override_raw
+  override_raw="$(trim "${UK_AQ_BACKFILL_DENO_BIN:-}")"
+  if [[ -n "${override_raw}" ]]; then
+    if [[ ! -x "${override_raw}" ]]; then
+      echo "Invalid UK_AQ_BACKFILL_DENO_BIN (not executable): ${override_raw}" >&2
+      return 1
+    fi
+    printf '%s' "${override_raw}"
+    return 0
+  fi
+
+  local candidate=""
+  candidate="$(command -v deno 2>/dev/null || true)"
+  if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+    printf '%s' "${candidate}"
+    return 0
+  fi
+
+  for candidate in \
+    "/usr/local/bin/deno" \
+    "/opt/homebrew/bin/deno" \
+    "/usr/bin/deno" \
+    "/bin/deno"
+  do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+
+  echo "deno executable not found. Install deno or set UK_AQ_BACKFILL_DENO_BIN to a full executable path." >&2
+  return 1
+}
+
+resolve_node_bin() {
+  local override_raw
+  override_raw="$(trim "${UK_AQ_BACKFILL_NODE_BIN:-}")"
+  if [[ -n "${override_raw}" ]]; then
+    if [[ ! -x "${override_raw}" ]]; then
+      echo "Invalid UK_AQ_BACKFILL_NODE_BIN (not executable): ${override_raw}" >&2
+      return 1
+    fi
+    printf '%s' "${override_raw}"
+    return 0
+  fi
+
+  local candidate=""
+  candidate="$(command -v node 2>/dev/null || true)"
+  if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+    printf '%s' "${candidate}"
+    return 0
+  fi
+
+  for candidate in \
+    "/usr/local/bin/node" \
+    "/opt/homebrew/bin/node" \
+    "/usr/bin/node" \
+    "/bin/node"
+  do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+
+  echo "node executable not found. Install node or set UK_AQ_BACKFILL_NODE_BIN to a full executable path." >&2
+  return 1
 }
 
 prune_recent_run_starts() {
@@ -354,6 +430,8 @@ if [[ -n "${REQUESTED_TRIGGER_MODE}" && "${REQUESTED_TRIGGER_MODE}" != "manual" 
 fi
 TRIGGER_MODE="manual"
 RUN_JOB_PATH="$(resolve_run_job_path "${REPO_ROOT}")"
+DENO_BIN="$(resolve_deno_bin)"
+NODE_BIN="$(resolve_node_bin)"
 
 mkdir -p "${LOG_DIR}"
 
@@ -407,6 +485,8 @@ while IFS=' ' read -r month_from month_to; do
   echo "Force replace: ${FORCE_REPLACE}"
   echo "Output scope: ${OUTPUT_SCOPE}"
   echo "Runner: ${RUN_JOB_PATH}"
+  echo "Deno bin: ${DENO_BIN}"
+  echo "Node bin: ${NODE_BIN}"
 
   export UK_AQ_BACKFILL_TRIGGER_MODE="${TRIGGER_MODE}"
   export UK_AQ_BACKFILL_RUN_MODE="${RUN_MODE}"
@@ -421,7 +501,7 @@ while IFS=' ' read -r month_from month_to; do
   enforce_run_rate_limit "${MAX_RUNS_PER_HOUR}" 3600 "local-backfill per-hour"
   RUN_START_EPOCHS+=("$(date +%s)")
 
-  if deno run --allow-env --allow-net --allow-read --allow-write --allow-run \
+  if "${DENO_BIN}" run --allow-env --allow-net --allow-read --allow-write --allow-run \
     "${RUN_JOB_PATH}" | tee "${log_file}"; then
     echo "Window ${month_from} -> ${month_to}: ok"
   else
@@ -448,10 +528,28 @@ fi
 
 if [[ "${DRY_RUN}" == "false" && ( "${RUN_MODE}" == "source_to_r2" || "${RUN_MODE}" == "obs_aqi_to_r2" || "${RUN_MODE}" == "r2_history_obs_to_aqilevels" ) ]]; then
   index_log_file="${LOG_DIR}/r2_history_index_${RUN_STARTED_AT_UTC}_${LOG_CONNECTOR_SEGMENT}_${REQUESTED_FROM_DAY_UTC}_to_${REQUESTED_TO_DAY_UTC}.log"
+  index_rebuild_max_attempts=3
+  index_rebuild_retry_sleep_seconds=5
   echo ""
   echo "=== Rebuild R2 History Index ==="
   echo "Log: ${index_log_file}"
-  if node scripts/backup_r2/uk_aq_build_r2_history_index.mjs | tee "${index_log_file}"; then
+  : > "${index_log_file}"
+  index_rebuild_ok="false"
+  for ((index_rebuild_attempt=1; index_rebuild_attempt<=index_rebuild_max_attempts; index_rebuild_attempt++)); do
+    echo "R2 history index rebuild attempt ${index_rebuild_attempt}/${index_rebuild_max_attempts}" | tee -a "${index_log_file}"
+    if "${NODE_BIN}" scripts/backup_r2/uk_aq_build_r2_history_index.mjs 2>&1 | tee -a "${index_log_file}"; then
+      index_rebuild_ok="true"
+      break
+    fi
+    index_rebuild_exit_code=$?
+    echo "R2 history index rebuild attempt ${index_rebuild_attempt}/${index_rebuild_max_attempts} failed (exit=${index_rebuild_exit_code})." | tee -a "${index_log_file}" >&2
+    if (( index_rebuild_attempt < index_rebuild_max_attempts )); then
+      echo "Retrying R2 history index rebuild in ${index_rebuild_retry_sleep_seconds}s..." | tee -a "${index_log_file}"
+      sleep "${index_rebuild_retry_sleep_seconds}"
+    fi
+  done
+
+  if [[ "${index_rebuild_ok}" == "true" ]]; then
     echo "R2 history index rebuild: ok"
   else
     echo "R2 history index rebuild: failed" >&2
