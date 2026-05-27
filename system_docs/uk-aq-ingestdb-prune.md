@@ -62,6 +62,20 @@ Comparison scope rule:
 - deletable plan at `INFO`
 - history-only buckets at `INFO` with event `history_extra_buckets`
 
+5. Late-arrival cleanup pass (code-only, no new env vars):
+- After the main window run, the service scans stale observations directly by `observed_at` and looks for any rows older than the current prune window start.
+- Discovery bounds:
+  - page size `1000`
+  - max discovery pages `100`
+  - discovery scan cap `100,000` stale rows per run
+  - max targeted day windows per run `14`
+- The late-arrival target list is split by the obs_aqidb retention cutover:
+  - days older than `OBS_AQIDB_OBSERVS_RETENTION_DAYS` (default `14`, overrideable via `obsAqidbObservsRetentionDays`) are deleted directly from ingest by hour bucket, without compare/repair
+  - younger days still run the normal targeted 24-hour compare/repair/delete flow and the same history gate checks
+  - the `14`-day cap now applies only to the repair-eligible subset, not to the direct-delete subset
+- If the backlog is larger than the discovery scan cap, rerunning the prune job will continue from the remaining stale rows.
+- This catches backfilled historical observations that arrived recently without widening the normal daily prune window.
+
 ## Dry-run behavior
 
 When `INGESTDB_PRUNE_DRY_RUN=true`, no delete RPC is called.
@@ -135,6 +149,11 @@ Each bucket is deleted in bounded batches until:
   - `ingestdb_prune_batch_plan` at run start
   - per-batch `ingestdb_prune_run_start`
   - one final aggregate summary event (`ingestdb_prune_dry_run_batched_summary` or `ingestdb_prune_delete_batched_summary`)
+- Late-arrival pass logs:
+  - `ingestdb_late_arrival_discovery_summary`
+  - `ingestdb_late_arrival_cleanup_plan`
+  - `ingestdb_late_arrival_cleanup_summary`
+  - optional per-day failure event: `ingestdb_late_arrival_cleanup_day_error`
 - History-only buckets (present in history, missing in ingest) are logged once per run as:
   - `severity=INFO`
   - `event=history_extra_buckets`
