@@ -1,5 +1,6 @@
 import { errorEnvelope, okEnvelope } from "../lib/http";
-import { fetchUpstreamJson, UpstreamError, type WorkerEnv } from "../lib/upstream";
+import { getDirectDashboardPayload } from "../lib/direct";
+import { UpstreamError, type WorkerEnv } from "../lib/upstream";
 
 type DashboardPayload = {
   project_ref?: string;
@@ -39,7 +40,7 @@ async function fetchDashboardPayload(
 ): Promise<DashboardPayload> {
   const params = new URLSearchParams(incomingSearch);
   params.set("include_storage_coverage", includeStorageCoverage ? "1" : "0");
-  const payload = await fetchUpstreamJson(env, "/api/dashboard", params);
+  const payload = await getDirectDashboardPayload(env, params);
   return payload as DashboardPayload;
 }
 
@@ -58,6 +59,7 @@ export async function handleHealthRoute(env: WorkerEnv): Promise<Response> {
   return okEnvelope({
     service: "uk-aq-ops-dashboard-api",
     upstreamConfigured,
+    mode: upstreamConfigured ? "upstream_or_direct_auto" : "direct",
   });
 }
 

@@ -4,6 +4,33 @@ export type WorkerEnv = {
   DASHBOARD_UPSTREAM_BASE_URL?: string;
   DASHBOARD_UPSTREAM_BEARER_TOKEN?: string;
   UKAQ_PROXY_ROUTE_PREFIX?: string;
+  SUPABASE_URL?: string;
+  SB_SECRET_KEY?: string;
+  OBS_AQIDB_SUPABASE_URL?: string;
+  OBS_AQIDB_SECRET_KEY?: string;
+  UK_AQ_CORE_SCHEMA?: string;
+  UK_AQ_PUBLIC_SCHEMA?: string;
+  UK_AQ_OPS_SCHEMA?: string;
+  UK_AQ_DB_SIZE_API_URL?: string;
+  UK_AQ_DB_SIZE_API_TOKEN?: string;
+  UK_AQ_DB_SIZE_LOOKBACK_DAYS?: string;
+  UK_AQ_R2_HISTORY_DAYS_API_URL?: string;
+  UK_AQ_R2_HISTORY_DAYS_API_TOKEN?: string;
+  UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS?: string;
+  UK_AQ_R2_HISTORY_COUNTS_API_URL?: string;
+  UK_AQ_R2_HISTORY_COUNTS_API_TOKEN?: string;
+  UK_AQ_R2_HISTORY_WINDOW_RPC?: string;
+  UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID?: string;
+  UK_AQ_R2_CLOUDFLARE_API_TOKEN?: string;
+  CLOUDFLARE_ACCOUNT_ID?: string;
+  CFLARE_API_READ_TOKEN?: string;
+  DROPBOX_APP_KEY?: string;
+  DROPBOX_APP_SECRET?: string;
+  DROPBOX_REFRESH_TOKEN?: string;
+  UK_AQ_DROPBOX_ROOT?: string;
+  UK_AQ_R2_HISTORY_DROPBOX_DIR?: string;
+  UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH?: string;
+  CLEANAIRSURB_ST_ID?: string;
 };
 
 export type ProxyCacheOptions = {
@@ -38,6 +65,24 @@ function resolveBaseUrl(env: WorkerEnv): string {
     );
   }
   return base;
+}
+
+export function shouldUseUpstream(request: Request, env: WorkerEnv): boolean {
+  const base = String(env.DASHBOARD_UPSTREAM_BASE_URL || "").trim().replace(/\/+$/, "");
+  if (!base) {
+    return false;
+  }
+  try {
+    const upstreamHost = new URL(base).host.toLowerCase();
+    const requestHost = new URL(request.url).host.toLowerCase();
+    // Guard against self-proxy loops when the upstream URL points at the same route hostname.
+    if (upstreamHost === requestHost) {
+      return false;
+    }
+    return true;
+  } catch (_err) {
+    return false;
+  }
 }
 
 function normalizePath(pathname: string): string {

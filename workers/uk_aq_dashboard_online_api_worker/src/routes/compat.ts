@@ -1,5 +1,6 @@
 import { errorEnvelope } from "../lib/http";
-import { proxyToUpstream, type WorkerEnv } from "../lib/upstream";
+import { handleDirectCompatRoute } from "../lib/direct";
+import { proxyToUpstream, shouldUseUpstream, type WorkerEnv } from "../lib/upstream";
 
 const GET_ROUTES = new Set([
   "/api/config",
@@ -55,10 +56,14 @@ export async function handleCompatRoute(
   pathname: string,
 ): Promise<Response> {
   const method = request.method.toUpperCase();
+  const useUpstream = shouldUseUpstream(request, env);
 
   if (GET_ROUTES.has(pathname)) {
     if (method !== "GET") {
       return errorEnvelope("METHOD_NOT_ALLOWED", "Only GET is supported for this route", 405);
+    }
+    if (!useUpstream) {
+      return handleDirectCompatRoute(request, env, pathname);
     }
     return proxyToUpstream(request, env, pathname, {
       cacheTtlSeconds: GET_ROUTE_CACHE_SECONDS[pathname] ?? 0,
@@ -73,6 +78,9 @@ export async function handleCompatRoute(
   if (POST_ROUTES.has(pathname)) {
     if (method !== "POST") {
       return errorEnvelope("METHOD_NOT_ALLOWED", "Only POST is supported for this route", 405);
+    }
+    if (!useUpstream) {
+      return handleDirectCompatRoute(request, env, pathname);
     }
     return proxyToUpstream(request, env, pathname);
   }

@@ -24,12 +24,12 @@ These values are safe to expose in shipped client assets.
 
 Worker runtime:
 
-- `DASHBOARD_UPSTREAM_BASE_URL` (required)
+- `DASHBOARD_UPSTREAM_BASE_URL` (optional; only for upstream proxy mode)
 - `DASHBOARD_UPSTREAM_BEARER_TOKEN` (optional)
 
 Store worker secrets in Cloudflare Worker secrets.
 
-Dashboard backend Cloud Run runtime:
+Dashboard upstream backend runtime (wherever hosted):
 
 - required:
   - `SUPABASE_URL`
@@ -51,24 +51,21 @@ Dashboard backend Cloud Run runtime:
   - `CLOUDFLARE_ACCOUNT_ID`
   - `CFLARE_API_READ_TOKEN`
 
-## Worker deploy credentials (GitHub Actions)
+## Dashboard deploy credentials (GitHub Actions)
 
-Option A split used in this repo:
+Dashboard Pages + dashboard API worker workflows use:
 
-- Domain workers:
-  - var: `UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID`
-  - secret: `UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN`
-- R2 workers:
-  - var: `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID`
-  - secret: `UK_AQ_R2_CLOUDFLARE_API_TOKEN`
+- var: `UK_AQ_CF_ACCOUNT_ID_UKAQ`
+- secret: `UK_AQ_CF_API_TOKEN_UKAQ`
 
-Recommended worker-name vars for test/live side-by-side deployments:
+Dashboard routing/project vars:
 
+- `UK_AQ_OPS_ADMIN_ZONE_NAME`
+- `UK_AQ_OPS_ADMIN_HOSTNAME`
 - `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME`
-- `UK_AQ_CACHE_WORKER_NAME`
-- `UK_AQ_DB_R2_METRICS_API_WORKER_NAME`
-- `UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME`
-- `UK_AQ_AQI_HISTORY_R2_API_WORKER_NAME`
+- `UK_AQ_OPS_DASHBOARD_PAGES_PROJECT`
+
+Other repo workers still use their existing credential families (`UK_AQ_DOMAIN_CLOUDFLARE_*`, `UK_AQ_R2_CLOUDFLARE_*`, etc.).
 
 ## What belongs where
 
@@ -94,12 +91,7 @@ Local:
 - Typical `apiBaseUrl` is `/api`.
 - Run local backend with `local/scripts/run_dashboard_local.sh`.
 
-Test:
+Test/Live:
 
-- Generate config in GitHub Actions using test repo variables.
-- Point Worker to test upstream backend.
-
-Live:
-
-- Generate config in live repo using live variables.
-- Point Worker to live upstream backend.
+- Generate config in each repo using that repo's `UKAQ_*` values.
+- Keep `DASHBOARD_UPSTREAM_BASE_URL` empty for direct online mode unless you explicitly want upstream proxy mode.
