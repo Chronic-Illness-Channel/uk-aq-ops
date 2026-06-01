@@ -287,6 +287,18 @@ function buildUrl(base: string, path: string, params?: Record<string, string | u
   return url.toString();
 }
 
+function appendQueryParams(urlValue: string, params?: Record<string, string | undefined>): string {
+  const url = new URL(urlValue);
+  if (params) {
+    for (const [key, value] of Object.entries(params)) {
+      if (typeof value === "string" && value.length > 0) {
+        url.searchParams.set(key, value);
+      }
+    }
+  }
+  return url.toString();
+}
+
 function resolveUrlOrigin(urlValue: string): string {
   try {
     const parsed = new URL(urlValue);
@@ -504,7 +516,7 @@ async function fetchR2HistoryDays(
   const maxDays = Math.max(1, Math.min(3660, Math.trunc(readNumber(env.UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS, 3660))));
   try {
     const payload = await fetchJsonObject(
-      buildUrl(apiUrl, "", { max_days: String(maxDays) }),
+      appendQueryParams(apiUrl, { max_days: String(maxDays) }),
       { method: "GET", headers },
       "R2 history-days API",
     );
@@ -573,8 +585,19 @@ function extractR2UsagePoint(value: unknown): { used_bytes: number; object_count
     return null;
   }
   const row = value as JsonObject;
-  const bytes = readNumber(row.used_bytes, Number.NaN);
-  const objects = readNumber(row.object_count, Number.NaN);
+  const usedBytes = readNumber(row.used_bytes, Number.NaN);
+  const payloadBytes = readNumber(row.payloadSize, Number.NaN);
+  const metadataBytes = readNumber(row.metadataSize, Number.NaN);
+  const objectsLegacy = readNumber(row.object_count, Number.NaN);
+  const objectsModern = readNumber(row.objects, Number.NaN);
+
+  const bytes = Number.isFinite(usedBytes)
+    ? usedBytes
+    : Number.isFinite(payloadBytes)
+      ? payloadBytes + (Number.isFinite(metadataBytes) ? metadataBytes : 0)
+      : Number.NaN;
+  const objects = Number.isFinite(objectsLegacy) ? objectsLegacy : objectsModern;
+
   if (!Number.isFinite(bytes) || !Number.isFinite(objects)) {
     return null;
   }
@@ -681,7 +704,7 @@ async function fetchDbMetrics(env: WorkerEnv): Promise<{
     }
     try {
       const payload = await fetchJsonObject(
-        buildUrl(externalUrl, "", { lookback_days: String(lookbackDays) }),
+        appendQueryParams(externalUrl, { lookback_days: String(lookbackDays) }),
         { method: "GET", headers },
         "DB size API",
       );
@@ -1546,9 +1569,13 @@ export async function getDirectR2MetricsPayload(
     fetchR2BackupWindowFromSupabase(env),
   ]);
   const window = r2History.window || fallbackWindow.window;
-  let windowError: string | null = fallbackWindow.error;
-  if (r2History.error) {
-    windowError = windowError ? `${r2History.error}; ${windowError}` : r2History.error;
+  let windowError: string | null = null;
+  if (r2History.error && fallbackWindow.error) {
+    windowError = `${r2History.error}; ${fallbackWindow.error}`;
+  } else if (r2History.error) {
+    windowError = r2History.error;
+  } else if (!r2History.window && fallbackWindow.error) {
+    windowError = fallbackWindow.error;
   }
   return {
     r2_usage: r2Usage.usage,
@@ -1582,7 +1609,7 @@ export async function getDirectR2ConnectorCountsPayload(
       params[key] = value;
     }
   }
-  return fetchJsonObject(buildUrl(apiUrl, "", params), { method: "GET", headers }, "R2 history-counts API");
+  return fetchJsonObject(appendQueryParams(apiUrl, params), { method: "GET", headers }, "R2 history-counts API");
 }
 
 export async function getDirectDailyTaskRunsPayload(
