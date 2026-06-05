@@ -19,6 +19,12 @@ Optional query params:
 
 - `scope` (must be `timeseries`; default `timeseries`)
 - `grain` (must be `hourly`; default `hourly`)
+- `format`
+  - default `compact` JSON with `columns` + compact `points` arrays
+  - aliases:
+    - `json` -> compact JSON
+    - `objects` -> row-object JSON
+    - `tsv` -> legacy tab-separated text
 - time range (one of):
   - `from_utc` + `to_utc` (ISO timestamps)
   - aliases: `start_utc`/`end_utc`, `from`/`to`, `start`/`end`
@@ -39,7 +45,10 @@ R2 paths expected:
   - `${UK_AQ_R2_HISTORY_AQILEVELS_PREFIX}/day_utc=YYYY-MM-DD/manifest.json`
 - connector manifest:
   - `${UK_AQ_R2_HISTORY_AQILEVELS_PREFIX}/day_utc=YYYY-MM-DD/connector_id=NN/manifest.json`
+- compact immutable-day band cache:
+  - `history/v1/aqilevels/bands/v1/day_utc=YYYY-MM-DD/connector_id=NN/timeseries_ids=.../pollutant=all|pm25|pm10|no2.json`
 - the worker resolves timeseries window context from `uk_aq_public.uk_aq_timeseries_aqi_hourly` (including `connector_id`, `station_id`, and window `timeseries_ids`) and narrows scans accordingly
+- if the ObsAQIDB context lookup misses for an R2-only timeseries, the worker still scans R2 directly by timeseries id across day connector manifests instead of returning an empty response
 - optional AQI timeseries index (fast-path):
   - `${UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX}/day_utc=YYYY-MM-DD/connector_id=NN/manifest.json`
   - the worker resolves window timeseries ids from `uk_aq_public.uk_aq_timeseries_aqi_hourly` and narrows parquet file scans using each file's `min_timeseries_id/max_timeseries_id`
@@ -49,9 +58,9 @@ R2 paths expected:
 Serving rule:
 
 - R2 history is always read first across the full requested window.
-- Recent fallback window is controlled by `UK_AQ_AQI_HISTORY_SOURCE_OF_TRUTH_HOURS` (default last 7 days).
-- ObsAQIDB is queried only when recent R2 coverage appears missing/incomplete.
-- ObsAQIDB rows are used as fallback/repairs; overlapping timestamps keep R2 values.
+- Recent ObsAQIDB fallback is controlled by `INGESTDB_RETENTION_DAYS` (default 5 in the shared env map; 4 in the current test `.env`) with a one-day overlap at the cutover.
+- ObsAQIDB is queried whenever the requested window overlaps that ingest retention window.
+- ObsAQIDB rows are used as fallback/repairs; overlapping timestamps keep R2 values, so R2 always wins on shared timestamps.
 - R2 uses committed day manifests:
   - a UTC day is served only when the day manifest exists.
   - no `_SUCCESS` marker or loose parquet scan fallback is used.
@@ -66,7 +75,7 @@ Required runtime secrets for stitched mode:
 
 Useful runtime vars:
 
-- `UK_AQ_AQI_HISTORY_SOURCE_OF_TRUTH_HOURS` (default `168`)
+- `INGESTDB_RETENTION_DAYS` (default `5`)
 - `UK_AQ_AQI_HISTORY_OBSAQIDB_TIMEOUT_MS` (default `10000`)
 - `UK_AQ_AQI_HISTORY_R2_PARQUET_ROW_CHUNK_SIZE` (default `5000`)
 - `UK_AQ_R2_HISTORY_INDEX_PREFIX` (default `history/_index`)
@@ -76,9 +85,9 @@ Useful runtime vars:
 
 Response:
 
-- returns hourly points sorted by `period_start_utc` ascending:
-  - `{ period_start_utc, daqi_index_level, eaqi_index_level, timeseries_id, station_id }`
-- includes source and coverage diagnostics (history + obs_aqidb windows/counts, `target_connector_id`, `target_station_id`, `timeseries_window_context_lookup_*`, `coverage.timeseries_index`, plus `obs_aqidb_status` and `obs_aqidb_fallback_*` when recent fallback is used).
+- default JSON response uses `wire_format=json`, `data_format=compact`, `columns`, and compact `points` arrays.
+- `format=objects` returns row-object JSON; `format=tsv` returns a legacy tab-separated payload.
+- includes source and coverage diagnostics (history + obs_aqidb windows/counts, `target_connector_id`, `target_station_id`, `timeseries_window_context_lookup_*`, `coverage.timeseries_index`, `coverage.aqi_band_cache`, plus `obs_aqidb_status` and `obs_aqidb_fallback_*` when recent fallback is used).
 - includes `response_complete` plus scan-completeness diagnostics (`coverage.history_scan_complete` and `coverage.history_scan_stopped_reason`) so clients can detect partial history scans.
 - includes `cache_scope` of `recent` or `immutable`
 - sets `x-ukaq-cache: HIT|MISS`.
