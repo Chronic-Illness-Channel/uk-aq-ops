@@ -7,7 +7,6 @@ import {
   mergeSlices,
   normalizeObservedRow,
   resolveTimeseriesWindowBounds,
-  subtractCoveredTailInterval,
 } from "./timeseries_v2_stitch.mjs";
 
 export interface Env {
@@ -228,6 +227,7 @@ const AQI_HISTORY_UPSTREAM_MAX_ATTEMPTS = 6;
 const AQI_HISTORY_UPSTREAM_RETRY_DELAY_MS = 700;
 const UPSTREAM_RETRY_STATUSES = new Set([502, 503, 504]);
 const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
 const AQI_HISTORY_CANONICALIZE_MIN_WINDOW_MS = 3 * 24 * HOUR_MS;
 const AQI_HISTORY_START_KEYS = ["from_utc", "start_utc", "from", "start"] as const;
 const AQI_HISTORY_END_KEYS = ["to_utc", "end_utc", "to", "end"] as const;
@@ -1368,8 +1368,8 @@ async function fetchR2ObservationsPaged(
 
   return {
     rows: Array.from(rowsByObservedAt.values()).sort((left, right) => {
-      const leftMs = parseIsoMsOrNull(left?.observed_at ?? null) ?? 0;
-      const rightMs = parseIsoMsOrNull(right?.observed_at ?? null) ?? 0;
+      const leftMs = parseIsoMsOrNull(String(left?.observed_at ?? "")) ?? 0;
+      const rightMs = parseIsoMsOrNull(String(right?.observed_at ?? "")) ?? 0;
       return leftMs - rightMs;
     }),
     coverage: mergedCoverage,
@@ -1491,14 +1491,6 @@ async function stitchTimeseriesV2FromR2AndIngest(
   const requestWindow = buildTimeseriesV2RequestWindow(requestUrl, runtime);
   const requestStartUtc = toIsoSafe(requestWindow.requestStartMs);
   const requestEndUtc = toIsoSafe(requestWindow.requestEndMs);
-  const overlapSince = applySinceOverlap(
-    requestWindow.requestSinceIso,
-    runtime.incrementalOverlapMinutes,
-    requestWindow.requestStartMs,
-  );
-  const r2Errors: string[] = [];
-  const ingestErrors: string[] = [];
-
   const originPayload = await fetchTimeseriesOriginPayload(
     deps.supabaseUrl,
     deps.supabasePublishableKey,
@@ -1511,199 +1503,7 @@ async function stitchTimeseriesV2FromR2AndIngest(
     },
   );
 
-  if (!flags.r2First) {
-    return buildTimeseriesV2FallbackEnvelope(requestUrl, originPayload, cacheStatus);
-  }
-
-  if (!deps.r2HistoryApiUrl) {
-    return buildTimeseriesV2FallbackEnvelope(
-      requestUrl,
-      originPayload,
-      cacheStatus,
-      "origin_only_v2_wrapper_r2_unconfigured",
-      ["r2_history_api_url_missing"],
-      [],
-    );
-  }
-
-  const connectorId = await loadTimeseriesConnectorId(
-    deps.supabaseUrl,
-    deps.sbSecretKey,
-    requestWindow.timeseriesId,
-  );
-  if (connectorId === null || !deps.r2HistoryApiUrl) {
-    return buildTimeseriesV2FallbackEnvelope(
-      requestUrl,
-      originPayload,
-      cacheStatus,
-      "origin_only_v2_wrapper_connector_unresolved",
-      ["connector_lookup_unavailable"],
-      [],
-    );
-  }
-
-  let r2Payload: Record<string, unknown> | null = null;
-  let r2Rows: Array<Record<string, unknown>> = [];
-  try {
-    const pagedR2 = await fetchR2ObservationsPaged(
-      deps.r2HistoryApiUrl,
-      deps.upstreamAuthSecret,
-      {
-        timeseriesId: requestWindow.timeseriesId,
-        connectorId,
-        startUtc: requestStartUtc,
-        endUtc: requestEndUtc,
-        sinceUtc: overlapSince,
-        pageLimitRows: runtime.maxR2ObjectsPerRequest,
-        maxPages: TIMESERIES_V2_MAX_R2_PAGES_PER_REQUEST,
-      },
-    );
-    r2Payload = pagedR2.coverage ? { coverage: pagedR2.coverage } : null;
-    r2Rows = pagedR2.rows;
-    if (pagedR2.hitPageLimit) {
-      r2Errors.push(`r2_page_limit_reached_${pagedR2.pagesFetched}`);
-    }
-  } catch (error) {
-    r2Errors.push(error instanceof Error ? error.message : String(error));
-    if (!runtime.partialOnR2Error) {
-      throw error;
-    }
-  }
-
-  const coverage = computeCoverageFromRows(r2Rows) as { coverageStart: string | null; coverageEnd: string | null };
-  const tail = subtractCoveredTailInterval(
-    requestWindow.requestStartMs,
-    requestWindow.requestEndMs,
-    coverage.coverageEnd,
-  ) as { tailStartMs: number; tailEndMs: number };
-  const maxTailSpanMs = runtime.maxSupabaseTailHours * HOUR_MS;
-
-  const missingKeys = [
-    ...(
-      ((r2Payload?.coverage as Record<string, unknown> | undefined)?.missing_day_manifest_keys as unknown[]) || []
-    ),
-    ...(
-      ((r2Payload?.coverage as Record<string, unknown> | undefined)?.missing_connector_manifest_keys as unknown[]) || []
-    ),
-    ...(
-      ((r2Payload?.coverage as Record<string, unknown> | undefined)?.missing_parquet_keys as unknown[]) || []
-    ),
-  ].map((item) => String(item ?? "")).filter(Boolean);
-
-  const missingSlices = buildMissingDaySlices(
-    missingKeys,
-    requestWindow.requestStartMs,
-    requestWindow.requestEndMs,
-  ) as Array<{ startMs: number; endMs: number; reason: string }>;
-  const ingestSlices = mergeSlices([
-    ...(tail.tailEndMs > tail.tailStartMs ? [{ startMs: tail.tailStartMs, endMs: tail.tailEndMs, reason: "tail_after_r2" }] : []),
-    ...missingSlices,
-  ]) as Array<{ startMs: number; endMs: number; reason: string }>;
-
-  const ingestRows: Array<Record<string, unknown>> = [];
-  for (const slice of ingestSlices) {
-    if ((slice.endMs - slice.startMs) > maxTailSpanMs) {
-      continue;
-    }
-    try {
-      const payload = await fetchTimeseriesOriginPayload(
-        deps.supabaseUrl,
-        deps.supabasePublishableKey,
-        deps.upstreamAuthSecret,
-        {
-          timeseriesId: requestWindow.timeseriesId,
-          startUtc: toIsoSafe(slice.startMs),
-          endUtc: toIsoSafe(slice.endMs),
-          sinceUtc: overlapSince,
-        },
-      );
-      ingestRows.push(...parseTimeseriesRowsFromPayload(payload, "ingest"));
-    } catch (error) {
-      ingestErrors.push(`${slice.reason}:${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-
-  if (ingestErrors.length > 0 && !runtime.partialOnIngestError) {
-    if (r2Rows.length === 0 || (tail.tailEndMs > tail.tailStartMs)) {
-      throw new Error("ingest_tail_fetch_failed");
-    }
-  }
-
-  const merged = mergeAndDedupeRows(
-    r2Rows,
-    ingestRows,
-    flags.allowIngestOverwrite,
-  ) as { merged: Array<Record<string, unknown>>; deduped: number };
-  const gapInfo = detectGapRanges(
-    merged.merged,
-    requestWindow.requestStartMs,
-    requestWindow.requestEndMs,
-    requestWindow.normalizedWindowLabel ?? "24h",
-  ) as { hasGap: boolean; gapRanges: Array<{ start_utc: string; end_utc: string }> };
-  if (merged.merged.length === 0) {
-    gapInfo.hasGap = true;
-    gapInfo.gapRanges = [{
-      start_utc: requestStartUtc,
-      end_utc: requestEndUtc,
-    }];
-  }
-  const nextSince = computeNextSince(merged.merged, requestWindow.requestSinceIso);
-
-  let sourceMode = "r2_plus_ingest_tail";
-  if (r2Rows.length === 0 && ingestRows.length === 0) {
-    sourceMode = "no_data_in_window";
-  } else if (r2Rows.length > 0 && ingestRows.length === 0) {
-    sourceMode = "r2_only";
-  } else if (r2Rows.length === 0 && ingestRows.length > 0) {
-    sourceMode = "ingest_only_fallback";
-  } else if (ingestSlices.some((slice) => slice.reason !== "tail_after_r2")) {
-    sourceMode = "r2_plus_ingest_tail_and_repairs";
-  }
-  if (r2Errors.length > 0 && ingestRows.length > 0 && sourceMode !== "no_data_in_window") {
-    sourceMode = "ingest_only_on_r2_error";
-  }
-
-  const meta: TimeseriesV2EnvelopeMeta = {
-    source_mode: sourceMode,
-    r2_coverage_start: coverage.coverageStart,
-    r2_coverage_end: coverage.coverageEnd,
-    ingest_tail_start: tail.tailEndMs > tail.tailStartMs ? toIsoSafe(tail.tailStartMs) : null,
-    ingest_tail_end: tail.tailEndMs > tail.tailStartMs ? toIsoSafe(tail.tailEndMs) : null,
-    has_gap: gapInfo.hasGap,
-    gap_ranges: gapInfo.gapRanges,
-    row_count: merged.merged.length,
-    r2_row_count: r2Rows.length,
-    ingest_row_count: ingestRows.length,
-    deduped_row_count: merged.deduped,
-    next_since: nextSince,
-    cache_status: cacheStatus,
-    r2_errors: r2Errors,
-    ingest_errors: ingestErrors,
-  };
-
-  const envelope = {
-    schema_version: 2,
-    timeseries_id: requestWindow.timeseriesId,
-    request: {
-      window: requestWindow.normalizedWindowLabel,
-      start_utc: requestStartUtc,
-      end_utc: requestEndUtc,
-      since: requestWindow.requestSinceIso,
-    },
-    data: merged.merged,
-    meta,
-    data_format: "objects",
-    columns: ["observed_at", "value", "source"],
-    next_since: nextSince,
-    guideline: originPayload.guideline ?? null,
-  };
-
-  return {
-    envelope,
-    meta,
-    sourceMode,
-    cacheControl: buildTimeseriesV2CacheControl(sourceMode, runtime),
-  };
+  return buildTimeseriesV2FallbackEnvelope(requestUrl, originPayload, cacheStatus);
 }
 
 function canonicalizeAqiHistoryRequestUrl(url: URL, upstreamFunction: string): URL {
