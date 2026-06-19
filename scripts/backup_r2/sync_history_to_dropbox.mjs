@@ -36,11 +36,16 @@ import {
 } from "./lib/rclone.mjs";
 import {
   COMMITTED_CONNECTOR_UNIT_KEYS,
-  DEFAULT_INVENTORY_REL_PATH,
+  RUN_MANIFEST_UNIT_KEYS,
+  defaultInventoryRelPathForBackupVersion,
+  defaultStateRelPathForBackupVersion,
   DOMAIN_NAMES,
-  INDEX_FILE_KEYS,
-  INDEX_TREE_KEYS,
+  domainNamesForBackupVersion,
+  indexFileKeysForBackupVersion,
+  indexTreeKeysForBackupVersion,
   loadInventory,
+  parseBackupVersion,
+  resolveBackupVersion,
 } from "./lib/inventory.mjs";
 
 function parseNonNegativeInt(rawValue, fallback) {
@@ -51,9 +56,11 @@ function parseNonNegativeInt(rawValue, fallback) {
   return intValue;
 }
 
-const DEFAULT_STATE_REL_PATH =
-  String(process.env.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || "").trim()
-  || "_ops/checkpoints/r2_history_backup_state_v1.json";
+const DEFAULT_BACKUP_VERSION = resolveBackupVersion(process.env);
+const ENV_STATE_REL_PATH =
+  String(process.env.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || "").trim();
+const DEFAULT_STATE_REL_PATH = ENV_STATE_REL_PATH
+  || defaultStateRelPathForBackupVersion(DEFAULT_BACKUP_VERSION);
 const DEFAULT_MAX_DAYS_PER_RUN = parseNonNegativeInt(
   process.env.UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN,
   0,
@@ -61,9 +68,10 @@ const DEFAULT_MAX_DAYS_PER_RUN = parseNonNegativeInt(
 const DEFAULT_RCLONE_BIN =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN || "").trim() || "rclone";
 const DEFAULT_REPORT_OUT = String(process.env.UK_AQ_R2_HISTORY_BACKUP_REPORT_OUT || "").trim();
-const DEFAULT_INVENTORY_REL_PATH_ENV =
-  String(process.env.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || "").trim()
-  || DEFAULT_INVENTORY_REL_PATH;
+const ENV_INVENTORY_REL_PATH =
+  String(process.env.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || "").trim();
+const DEFAULT_INVENTORY_REL_PATH_ENV = ENV_INVENTORY_REL_PATH
+  || defaultInventoryRelPathForBackupVersion(DEFAULT_BACKUP_VERSION);
 const DROPBOX_WRITE_RETRY_MAX_ATTEMPTS = 7;
 const DROPBOX_WRITE_RETRY_INITIAL_DELAY_MS = 5_000;
 const DROPBOX_WRITE_RETRY_MAX_DELAY_MS = 60_000;
@@ -113,13 +121,15 @@ function usage() {
       "  --dest-root     Example: uk_aq_dropbox:/CIC-Test/R2_history_backup",
       "",
       "Optional:",
+      `  --backup-version <v>         v1 | v2. Default: ${DEFAULT_BACKUP_VERSION}`,
       `  --inventory-rel-path <p>     Default: ${DEFAULT_INVENTORY_REL_PATH_ENV}`,
       `  --state-rel-path <path>      Default: ${DEFAULT_STATE_REL_PATH}`,
-      "  --domain <name>              observations | aqilevels | core (repeatable)",
+      "  --domain <name>              observations | aqilevels | aqilevels_debug | core (repeatable)",
       "  --max-days-per-run <N>       Safety throttle on day copies; 0 = unlimited",
       `  --rclone-bin <name>          Default: ${DEFAULT_RCLONE_BIN}`,
       "  --report-out <file>          Write JSON report to file",
       "  --dry-run                    Plan only; no copies, no checkpoint writes",
+      "  --show-version               Print resolved backup config and exit",
       "  -h, --help",
       "",
       "Requires a valid inventory at <source-root>/<inventory-rel-path>. Run",
@@ -130,19 +140,26 @@ function usage() {
 
 function parseArgs(argv) {
   const args = {
+    backup_version: DEFAULT_BACKUP_VERSION,
     source_root: "",
     dest_root: "",
-    inventory_rel_path: DEFAULT_INVENTORY_REL_PATH_ENV,
-    state_rel_path: DEFAULT_STATE_REL_PATH,
+    inventory_rel_path: ENV_INVENTORY_REL_PATH,
+    state_rel_path: ENV_STATE_REL_PATH,
     domains: [],
     max_days_per_run: DEFAULT_MAX_DAYS_PER_RUN,
     rclone_bin: DEFAULT_RCLONE_BIN,
     dry_run: false,
     report_out: DEFAULT_REPORT_OUT,
+    show_version: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
+    if (arg === "--backup-version") {
+      args.backup_version = parseBackupVersion(argv[i + 1], DEFAULT_BACKUP_VERSION);
+      i += 1;
+      continue;
+    }
     if (arg === "--source-root") {
       args.source_root = String(argv[i + 1] || "").trim();
       i += 1;
@@ -197,11 +214,26 @@ function parseArgs(argv) {
       args.dry_run = true;
       continue;
     }
+    if (arg === "--show-version") {
+      args.show_version = true;
+      continue;
+    }
     if (arg === "-h" || arg === "--help") {
       usage();
       process.exit(0);
     }
     throw new Error(`Unknown arg: ${arg}`);
+  }
+
+  if (!args.inventory_rel_path) {
+    args.inventory_rel_path = defaultInventoryRelPathForBackupVersion(args.backup_version);
+  }
+  if (!args.state_rel_path) {
+    args.state_rel_path = defaultStateRelPathForBackupVersion(args.backup_version);
+  }
+
+  if (args.show_version) {
+    return args;
   }
 
   if (!args.source_root) throw new Error("--source-root is required");
@@ -210,7 +242,7 @@ function parseArgs(argv) {
   if (!args.state_rel_path) throw new Error("--state-rel-path cannot be empty");
 
   if (args.domains.length === 0) {
-    args.domains = [...DOMAIN_NAMES];
+    args.domains = domainNamesForBackupVersion(args.backup_version);
   } else {
     args.domains = Array.from(new Set(args.domains));
   }
@@ -228,9 +260,9 @@ function emptyDomainState() {
   };
 }
 
-function emptyIndexTreeUnitsState() {
+function emptyIndexTreeUnitsState(indexTreeKeys = []) {
   const out = {};
-  for (const treeKey of INDEX_TREE_KEYS) {
+  for (const treeKey of indexTreeKeys) {
     out[treeKey] = { units: {} };
   }
   return out;
@@ -244,30 +276,49 @@ function emptyCommittedConnectorUnitsState() {
   return out;
 }
 
-function emptyCheckpointState(nowIso) {
+function emptyRunManifestUnitsState() {
+  const out = {};
+  for (const key of RUN_MANIFEST_UNIT_KEYS) {
+    out[key] = { units: {} };
+  }
+  return out;
+}
+
+function emptyCheckpointState(nowIso, {
+  backupVersion = "v1",
+  domainNames = domainNamesForBackupVersion(backupVersion),
+  indexTreeKeys = indexTreeKeysForBackupVersion(backupVersion),
+} = {}) {
   const domains = {};
-  for (const domain of DOMAIN_NAMES) {
+  for (const domain of domainNames) {
     domains[domain] = emptyDomainState();
   }
   return {
     version: 1,
+    backup_version: backupVersion,
     created_at: nowIso,
     updated_at: nowIso,
     domains,
     index_files: {},
-    index_tree_units: emptyIndexTreeUnitsState(),
+    index_tree_units: emptyIndexTreeUnitsState(indexTreeKeys),
     committed_connector_units: emptyCommittedConnectorUnitsState(),
+    run_manifest_units: emptyRunManifestUnitsState(),
   };
 }
 
-function sanitizeCheckpointState(rawState) {
+export function sanitizeCheckpointState(rawState, {
+  backupVersion = "v1",
+  domainNames = domainNamesForBackupVersion(backupVersion),
+  indexFileKeys = indexFileKeysForBackupVersion(backupVersion),
+  indexTreeKeys = indexTreeKeysForBackupVersion(backupVersion),
+} = {}) {
   const nowIso = new Date().toISOString();
   const state = rawState && typeof rawState === "object" && !Array.isArray(rawState)
     ? rawState
     : {};
 
   const domains = {};
-  for (const domain of DOMAIN_NAMES) {
+  for (const domain of domainNames) {
     const rawDomain = state.domains && typeof state.domains === "object"
       ? state.domains[domain]
       : null;
@@ -302,7 +353,7 @@ function sanitizeCheckpointState(rawState) {
   const rawIndexFiles = state.index_files && typeof state.index_files === "object" && !Array.isArray(state.index_files)
     ? state.index_files
     : {};
-  for (const indexKey of INDEX_FILE_KEYS) {
+  for (const indexKey of indexFileKeys) {
     const entry = rawIndexFiles[indexKey];
     if (entry && typeof entry === "object" && !Array.isArray(entry)) {
       indexFiles[indexKey] = {
@@ -315,11 +366,11 @@ function sanitizeCheckpointState(rawState) {
   }
 
   // Index tree units (new section). Old checkpoints lack this.
-  const indexTreeUnits = emptyIndexTreeUnitsState();
+  const indexTreeUnits = emptyIndexTreeUnitsState(indexTreeKeys);
   const rawTreeUnits = state.index_tree_units && typeof state.index_tree_units === "object" && !Array.isArray(state.index_tree_units)
     ? state.index_tree_units
     : {};
-  for (const treeKey of INDEX_TREE_KEYS) {
+  for (const treeKey of indexTreeKeys) {
     const rawTree = rawTreeUnits[treeKey];
     const rawUnits = rawTree && typeof rawTree === "object" && rawTree.units && typeof rawTree.units === "object"
       ? rawTree.units
@@ -337,6 +388,20 @@ function sanitizeCheckpointState(rawState) {
     indexTreeUnits[treeKey] = { units: cleanedUnits };
   }
 
+  function cleanFileUnitMap(rawUnits) {
+    const cleanedUnits = {};
+    for (const [unitKey, entry] of Object.entries(rawUnits || {})) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      cleanedUnits[String(unitKey)] = {
+        relative_path: String(entry.relative_path || "").trim(),
+        copied_at: String(entry.copied_at || "").trim(),
+        hash: String(entry.hash || "").trim(),
+        size: Number.isFinite(Number(entry.size)) ? Math.trunc(Number(entry.size)) : null,
+      };
+    }
+    return cleanedUnits;
+  }
+
   // Committed connector-manifest units (new section). Old checkpoints lack this.
   const committedConnectorUnits = emptyCommittedConnectorUnitsState();
   const rawCommittedUnits = state.committed_connector_units
@@ -349,39 +414,47 @@ function sanitizeCheckpointState(rawState) {
     const rawUnits = rawDomain && typeof rawDomain === "object" && rawDomain.units && typeof rawDomain.units === "object"
       ? rawDomain.units
       : {};
-    const cleanedUnits = {};
-    for (const [unitKey, entry] of Object.entries(rawUnits)) {
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-      cleanedUnits[String(unitKey)] = {
-        relative_path: String(entry.relative_path || "").trim(),
-        copied_at: String(entry.copied_at || "").trim(),
-        hash: String(entry.hash || "").trim(),
-        size: Number.isFinite(Number(entry.size)) ? Math.trunc(Number(entry.size)) : null,
-      };
-    }
-    committedConnectorUnits[domainKey] = { units: cleanedUnits };
+    committedConnectorUnits[domainKey] = { units: cleanFileUnitMap(rawUnits) };
+  }
+
+  const runManifestUnits = emptyRunManifestUnitsState();
+  const rawRunManifestUnits = state.run_manifest_units
+    && typeof state.run_manifest_units === "object"
+    && !Array.isArray(state.run_manifest_units)
+    ? state.run_manifest_units
+    : {};
+  for (const domainKey of RUN_MANIFEST_UNIT_KEYS) {
+    const rawDomain = rawRunManifestUnits[domainKey];
+    const rawUnits = rawDomain && typeof rawDomain === "object" && rawDomain.units && typeof rawDomain.units === "object"
+      ? rawDomain.units
+      : {};
+    runManifestUnits[domainKey] = { units: cleanFileUnitMap(rawUnits) };
   }
 
   return {
     version: Number.isFinite(Number(state.version)) ? Number(state.version) : 1,
+    backup_version: typeof state.backup_version === "string" && state.backup_version
+      ? state.backup_version
+      : backupVersion,
     created_at: typeof state.created_at === "string" && state.created_at ? state.created_at : nowIso,
     updated_at: typeof state.updated_at === "string" && state.updated_at ? state.updated_at : nowIso,
     domains,
     index_files: indexFiles,
     index_tree_units: indexTreeUnits,
     committed_connector_units: committedConnectorUnits,
+    run_manifest_units: runManifestUnits,
   };
 }
 
-function loadCheckpointState(rcloneBin, checkpointPath) {
+function loadCheckpointState(rcloneBin, checkpointPath, options = {}) {
   const nowIso = new Date().toISOString();
   const result = rcloneCatMaybe(rcloneBin, checkpointPath);
   if (!result.found) {
-    return { state: emptyCheckpointState(nowIso), existed: false };
+    return { state: emptyCheckpointState(nowIso, options), existed: false };
   }
   try {
     return {
-      state: sanitizeCheckpointState(JSON.parse(result.text)),
+      state: sanitizeCheckpointState(JSON.parse(result.text), options),
       existed: true,
     };
   } catch {
@@ -436,6 +509,20 @@ function markIndexTreeUnitCopied(state, treeKey, unitKey, details) {
     state.index_tree_units[treeKey] = { units: {} };
   }
   state.index_tree_units[treeKey].units[unitKey] = {
+    relative_path: details.relative_path,
+    copied_at: details.copied_at,
+    hash: details.hash,
+    size: details.size,
+  };
+  state.updated_at = details.copied_at;
+}
+
+function markRunManifestUnitCopied(state, domainKey, unitKey, details) {
+  if (!state.run_manifest_units[domainKey]
+      || typeof state.run_manifest_units[domainKey] !== "object") {
+    state.run_manifest_units[domainKey] = { units: {} };
+  }
+  state.run_manifest_units[domainKey].units[unitKey] = {
     relative_path: details.relative_path,
     copied_at: details.copied_at,
     hash: details.hash,
@@ -533,9 +620,13 @@ export function planDays(inventory, state, args) {
   return plan;
 }
 
-export function planIndexFiles(inventory, state) {
+export function planIndexFiles(
+  inventory,
+  state,
+  { indexFileKeys = indexFileKeysForBackupVersion(inventory?.backup_version || "v1") } = {},
+) {
   const candidates = [];
-  for (const indexKey of INDEX_FILE_KEYS) {
+  for (const indexKey of indexFileKeys) {
     const invEntry = inventory?.index_files?.[indexKey];
     if (!invEntry || !invEntry.hash || !invEntry.relative_path) continue;
     const cpHash = String(state?.index_files?.[indexKey]?.hash || "").trim();
@@ -545,9 +636,13 @@ export function planIndexFiles(inventory, state) {
   return candidates;
 }
 
-export function planIndexTreeUnits(inventory, state) {
+export function planIndexTreeUnits(
+  inventory,
+  state,
+  { indexTreeKeys = indexTreeKeysForBackupVersion(inventory?.backup_version || "v1") } = {},
+) {
   const candidates = [];
-  for (const treeKey of INDEX_TREE_KEYS) {
+  for (const treeKey of indexTreeKeys) {
     const invUnits = inventory?.index_tree_units?.[treeKey]?.units || {};
     const cpUnits = state?.index_tree_units?.[treeKey]?.units || {};
     for (const unitKey of Object.keys(invUnits).sort()) {
@@ -560,6 +655,24 @@ export function planIndexTreeUnits(inventory, state) {
         unit_key: unitKey,
         inventory_entry: invEntry,
       });
+    }
+  }
+  return candidates;
+}
+
+export function planRunManifestUnits(inventory, state, args = {}) {
+  const candidates = [];
+  const domains = args.domains || RUN_MANIFEST_UNIT_KEYS;
+  for (const domainKey of RUN_MANIFEST_UNIT_KEYS) {
+    if (!domains.includes(domainKey)) continue;
+    const invUnits = inventory?.run_manifest_units?.[domainKey]?.units || {};
+    const cpUnits = state?.run_manifest_units?.[domainKey]?.units || {};
+    for (const unitKey of Object.keys(invUnits).sort()) {
+      const invEntry = invUnits[unitKey];
+      if (!invEntry || !invEntry.hash || !invEntry.relative_path) continue;
+      const cpHash = String(cpUnits[unitKey]?.hash || "").trim();
+      if (cpHash && cpHash === String(invEntry.hash).trim()) continue;
+      candidates.push({ domain_key: domainKey, unit_key: unitKey, inventory_entry: invEntry });
     }
   }
   return candidates;
@@ -590,6 +703,9 @@ export function planCommittedConnectorUnits(inventory, state, args) {
 
 async function main(args) {
   const startedAt = new Date().toISOString();
+  const domainNames = args.domains;
+  const indexFileKeys = indexFileKeysForBackupVersion(args.backup_version);
+  const indexTreeKeys = indexTreeKeysForBackupVersion(args.backup_version);
 
   const inventory = loadInventory(
     args.rclone_bin,
@@ -597,21 +713,36 @@ async function main(args) {
     args.inventory_rel_path,
     { strict: true },
   );
+  const inventoryBackupVersion = String(inventory?.backup_version || "v1").trim().toLowerCase();
+  if (inventoryBackupVersion !== args.backup_version) {
+    throw new Error(
+      `Inventory backup_version=${inventoryBackupVersion} does not match selected backup version ${args.backup_version}. `
+      + `Use the matching --inventory-rel-path or rebuild the inventory for ${args.backup_version}.`,
+    );
+  }
 
   const checkpointPath = joinTargetPath(args.dest_root, args.state_rel_path);
-  const checkpointLoaded = loadCheckpointState(args.rclone_bin, checkpointPath);
+  const checkpointLoaded = loadCheckpointState(args.rclone_bin, checkpointPath, {
+    backupVersion: args.backup_version,
+    domainNames,
+    indexFileKeys,
+    indexTreeKeys,
+  });
   const state = checkpointLoaded.state;
 
   const report = {
     ok: true,
+    selected_backup_version: args.backup_version,
     started_at: startedAt,
     completed_at: null,
     source_root: args.source_root,
     dest_root: args.dest_root,
     inventory_rel_path: args.inventory_rel_path,
+    inventory_backup_version: inventoryBackupVersion,
     inventory_used: true,
     inventory_generated_at: typeof inventory.generated_at === "string" ? inventory.generated_at : null,
     state_checkpoint_path: checkpointPath,
+    state_rel_path: args.state_rel_path,
     state_existed: checkpointLoaded.existed,
     dry_run: args.dry_run,
     max_days_per_run: args.max_days_per_run,
@@ -619,6 +750,7 @@ async function main(args) {
     index_files: {},
     index_tree_units: {},
     committed_connector_units: {},
+    run_manifest_units: {},
     totals: {
       listed_days: 0,
       candidate_days: 0,
@@ -631,6 +763,8 @@ async function main(args) {
       index_tree_units_copied: 0,
       committed_connector_units_candidates: 0,
       committed_connector_units_copied: 0,
+      run_manifest_units_candidates: 0,
+      run_manifest_units_copied: 0,
     },
   };
 
@@ -686,7 +820,7 @@ async function main(args) {
   }
 
   // ---- Plan + copy latest index files ----
-  const indexFileCandidates = planIndexFiles(inventory, state);
+  const indexFileCandidates = planIndexFiles(inventory, state, { indexFileKeys });
   report.totals.index_files_candidates = indexFileCandidates.length;
   for (const candidate of indexFileCandidates) {
     const invEntry = candidate.inventory_entry;
@@ -719,7 +853,7 @@ async function main(args) {
   }
 
   // ---- Plan + copy timeseries index tree per-(day, connector) units ----
-  const indexTreeCandidates = planIndexTreeUnits(inventory, state);
+  const indexTreeCandidates = planIndexTreeUnits(inventory, state, { indexTreeKeys });
   report.totals.index_tree_units_candidates = indexTreeCandidates.length;
   for (const candidate of indexTreeCandidates) {
     const invEntry = candidate.inventory_entry;
@@ -749,6 +883,39 @@ async function main(args) {
       report.index_tree_units[candidate.tree_key] = { copied_units: [] };
     }
     report.index_tree_units[candidate.tree_key].copied_units.push(candidate.unit_key);
+  }
+
+  // ---- Plan + copy Phase B run manifests ----
+  const runManifestCandidates = planRunManifestUnits(inventory, state, args);
+  report.totals.run_manifest_units_candidates = runManifestCandidates.length;
+  for (const candidate of runManifestCandidates) {
+    const invEntry = candidate.inventory_entry;
+    const relativePath = String(invEntry.relative_path || "").trim();
+    const hash = String(invEntry.hash || "").trim();
+    if (!relativePath || !hash) {
+      throw new Error(
+        `Inventory run_manifest_units entry for ${candidate.domain_key}/${candidate.unit_key} is missing required fields`,
+      );
+    }
+    const sourcePath = joinTargetPath(args.source_root, relativePath);
+    const destPath = joinTargetPath(args.dest_root, relativePath);
+    copyFilePath(args.rclone_bin, sourcePath, destPath, args.dry_run);
+
+    if (!args.dry_run) {
+      const copiedAt = new Date().toISOString();
+      markRunManifestUnitCopied(state, candidate.domain_key, candidate.unit_key, {
+        relative_path: relativePath,
+        copied_at: copiedAt,
+        hash,
+        size: Number.isFinite(Number(invEntry.size)) ? Math.trunc(Number(invEntry.size)) : null,
+      });
+      writeCheckpointState(args.rclone_bin, checkpointPath, state);
+      report.totals.run_manifest_units_copied += 1;
+    }
+    if (!report.run_manifest_units[candidate.domain_key]) {
+      report.run_manifest_units[candidate.domain_key] = { copied_units: [] };
+    }
+    report.run_manifest_units[candidate.domain_key].copied_units.push(candidate.unit_key);
   }
 
   // ---- Plan + copy committed observations connector manifests ----
@@ -799,6 +966,21 @@ async function runCli() {
   try {
     const parsedArgs = parseArgs(process.argv.slice(2));
     reportOutPath = parsedArgs.report_out || reportOutPath;
+    if (parsedArgs.show_version) {
+      const selected = {
+        ok: true,
+        selected_backup_version: parsedArgs.backup_version,
+        default_inventory_rel_path: defaultInventoryRelPathForBackupVersion(parsedArgs.backup_version),
+        inventory_rel_path: parsedArgs.inventory_rel_path,
+        default_state_rel_path: defaultStateRelPathForBackupVersion(parsedArgs.backup_version),
+        state_rel_path: parsedArgs.state_rel_path,
+        default_domains: domainNamesForBackupVersion(parsedArgs.backup_version),
+        index_file_keys: indexFileKeysForBackupVersion(parsedArgs.backup_version),
+        index_tree_keys: indexTreeKeysForBackupVersion(parsedArgs.backup_version),
+      };
+      console.log(JSON.stringify(selected, null, 2));
+      return;
+    }
     await main(parsedArgs);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

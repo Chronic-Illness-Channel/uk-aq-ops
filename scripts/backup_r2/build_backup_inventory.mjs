@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 // Build the R2 History backup inventory used by the Dropbox sync.
 //
-// The inventory lives at <source-root>/<inventory-rel-path> (default
-// history/_index/backup_inventory_v1.json) and records one entry per backup
-// unit: per-domain day manifests, the four *_latest.json index files, and the
-// per-(day, connector) manifests under the timeseries index trees, plus
-// committed observations connector manifests.
+// The inventory lives at <source-root>/<inventory-rel-path>. The default path
+// is version-selected: history/_index/backup_inventory_v1.json for v1 or
+// history/_index_v2/backup_inventory_v2.json for v2. It records one entry per
+// backup unit: per-domain day manifests, selected *_latest.json index files,
+// selected timeseries index tree manifests, plus committed observations
+// connector manifests.
 //
 // On subsequent runs, `rclone lsjson` is used to compare each remote file's
 // size + MD5 etag against the previous inventory; matching entries are reused
@@ -18,6 +19,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   joinTargetPath,
@@ -31,30 +33,30 @@ import {
 import {
   COMMITTED_CONNECTOR_UNIT_KEYS,
   DOMAIN_NAMES,
-  INDEX_FILE_KEYS,
-  INDEX_TREE_KEYS,
+  defaultInventoryRelPathForBackupVersion,
+  domainNamesForBackupVersion,
+  indexFileKeysForBackupVersion,
+  indexTreeKeysForBackupVersion,
   INVENTORY_KIND,
   INVENTORY_SCHEMA_VERSION,
   loadInventory,
+  parseBackupVersion,
+  resolveBackupVersion,
+  RUN_MANIFEST_UNIT_KEYS,
+  runManifestPrefixForBackupVersion,
 } from "./lib/inventory.mjs";
 
-const DEFAULT_DOMAIN_PREFIXES = Object.freeze({
-  observations: normalizePrefix(
-    process.env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || "history/v1/observations",
-  ),
-  aqilevels: normalizePrefix(
-    process.env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels",
-  ),
-  core: normalizePrefix(
-    process.env.UK_AQ_R2_HISTORY_CORE_PREFIX || "history/v1/core",
-  ),
-});
+const DEFAULT_BACKUP_VERSION = resolveBackupVersion(process.env);
 const DEFAULT_INDEX_PREFIX = normalizePrefix(
   process.env.UK_AQ_R2_HISTORY_INDEX_PREFIX || "history/_index",
 );
-const DEFAULT_INVENTORY_REL_PATH =
-  String(process.env.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || "").trim()
-  || `${DEFAULT_INDEX_PREFIX || "history/_index"}/backup_inventory_v1.json`;
+const DEFAULT_INDEX_V2_PREFIX = normalizePrefix(
+  process.env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || "history/_index_v2",
+);
+const ENV_INVENTORY_REL_PATH =
+  String(process.env.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || "").trim();
+const DEFAULT_INVENTORY_REL_PATH = ENV_INVENTORY_REL_PATH
+  || defaultInventoryRelPathForBackupVersion(DEFAULT_BACKUP_VERSION);
 const DEFAULT_RCLONE_BIN =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN || "").trim() || "rclone";
 const DEFAULT_REPORT_OUT =
@@ -63,8 +65,46 @@ const DEFAULT_REPORT_OUT =
 const DAY_MANIFEST_PATTERN = /^day_utc=(\d{4}-\d{2}-\d{2})\/manifest\.json$/;
 const INDEX_TREE_UNIT_PATTERN =
   /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/manifest\.json$/;
+const INDEX_TREE_UNIT_V2_PATTERN =
+  /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/pollutant_code=(pm25|pm10|no2)\/manifest\.json$/;
 const COMMITTED_CONNECTOR_MANIFEST_PATTERN =
   /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/manifest\.json$/;
+const RUN_MANIFEST_UNIT_PATTERN = /^run_id=[^/]+\/run_manifest\.json$/;
+
+export function isRunManifestUnitPath(relativePath) {
+  return RUN_MANIFEST_UNIT_PATTERN.test(String(relativePath || ""));
+}
+
+function resolveDomainPrefixes(backupVersion, env = process.env) {
+  const version = parseBackupVersion(backupVersion);
+  if (version === "v2") {
+    return Object.freeze({
+      observations: normalizePrefix(
+        env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || "history/v2/observations",
+      ),
+      aqilevels: normalizePrefix(
+        env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || "history/v2/aqilevels/hourly/data",
+      ),
+      aqilevels_debug: normalizePrefix(
+        env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX || "history/v2/aqilevels/hourly/debug",
+      ),
+      core: normalizePrefix(
+        env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || "history/v2/core",
+      ),
+    });
+  }
+  return Object.freeze({
+    observations: normalizePrefix(
+      env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || "history/v1/observations",
+    ),
+    aqilevels: normalizePrefix(
+      env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels/hourly",
+    ),
+    core: normalizePrefix(
+      env.UK_AQ_R2_HISTORY_CORE_PREFIX || "history/v1/core",
+    ),
+  });
+}
 
 function usage() {
   console.log(
@@ -77,13 +117,17 @@ function usage() {
       "  --source-root              Example: uk_aq_r2:uk-aq-history-cic-test",
       "",
       "Optional:",
+      `  --backup-version <v>       v1 | v2. Default: ${DEFAULT_BACKUP_VERSION}`,
       `  --inventory-rel-path <p>   Default: ${DEFAULT_INVENTORY_REL_PATH}`,
-      "  --domain <name>            observations | aqilevels | core (repeatable)",
+      "  --domain <name>            observations | aqilevels | aqilevels_debug | core (repeatable)",
       `  --index-prefix <prefix>    Default: ${DEFAULT_INDEX_PREFIX || "history/_index"}`,
+      `  --index-v2-prefix <prefix> Default: ${DEFAULT_INDEX_V2_PREFIX || "history/_index_v2"}`,
+      "  --runs-prefix <prefix>     Override selected-version run manifest prefix",
       `  --rclone-bin <name>        Default: ${DEFAULT_RCLONE_BIN}`,
       "  --report-out <file>        Write JSON report to file",
       "  --dry-run                  Build/validate only; do not upload inventory",
       "  --full-rebuild             Ignore previous inventory; re-read every manifest",
+      "  --show-version             Print resolved backup config and exit",
       "  -h, --help",
     ].join("\n"),
   );
@@ -92,17 +136,26 @@ function usage() {
 function parseArgs(argv) {
   const args = {
     source_root: "",
-    inventory_rel_path: DEFAULT_INVENTORY_REL_PATH,
+    backup_version: DEFAULT_BACKUP_VERSION,
+    inventory_rel_path: ENV_INVENTORY_REL_PATH,
     domains: [],
     index_prefix: DEFAULT_INDEX_PREFIX,
+    index_v2_prefix: DEFAULT_INDEX_V2_PREFIX,
+    runs_prefix: "",
     rclone_bin: DEFAULT_RCLONE_BIN,
     report_out: DEFAULT_REPORT_OUT,
     dry_run: false,
     full_rebuild: false,
+    show_version: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
+    if (arg === "--backup-version") {
+      args.backup_version = parseBackupVersion(argv[i + 1], DEFAULT_BACKUP_VERSION);
+      i += 1;
+      continue;
+    }
     if (arg === "--source-root") {
       args.source_root = String(argv[i + 1] || "").trim();
       i += 1;
@@ -129,6 +182,17 @@ function parseArgs(argv) {
       i += 1;
       continue;
     }
+    if (arg === "--index-v2-prefix") {
+      args.index_v2_prefix =
+        normalizePrefix(argv[i + 1] || "") || DEFAULT_INDEX_V2_PREFIX;
+      i += 1;
+      continue;
+    }
+    if (arg === "--runs-prefix") {
+      args.runs_prefix = normalizePrefix(argv[i + 1] || "");
+      i += 1;
+      continue;
+    }
     if (arg === "--rclone-bin") {
       args.rclone_bin = String(argv[i + 1] || "").trim() || DEFAULT_RCLONE_BIN;
       i += 1;
@@ -147,11 +211,23 @@ function parseArgs(argv) {
       args.full_rebuild = true;
       continue;
     }
+    if (arg === "--show-version") {
+      args.show_version = true;
+      continue;
+    }
     if (arg === "-h" || arg === "--help") {
       usage();
       process.exit(0);
     }
     throw new Error(`Unknown arg: ${arg}`);
+  }
+
+  if (!args.inventory_rel_path) {
+    args.inventory_rel_path = defaultInventoryRelPathForBackupVersion(args.backup_version);
+  }
+
+  if (args.show_version) {
+    return args;
   }
 
   if (!args.source_root) {
@@ -161,7 +237,7 @@ function parseArgs(argv) {
     throw new Error("--inventory-rel-path cannot be empty");
   }
   if (args.domains.length === 0) {
-    args.domains = [...DOMAIN_NAMES];
+    args.domains = domainNamesForBackupVersion(args.backup_version);
   } else {
     args.domains = Array.from(new Set(args.domains));
   }
@@ -353,15 +429,16 @@ function scanIndexFile({
   sourceRoot,
   indexKey,
   indexPrefix,
+  fileName,
   previousEntry,
   excludeRelativePaths,
   stats,
 }) {
-  const fileName = `${indexKey}.json`;
-  const relativePath = indexPrefix ? `${indexPrefix}/${fileName}` : fileName;
+  const normalizedFileName = String(fileName || `${indexKey}.json`).trim();
+  const relativePath = indexPrefix ? `${indexPrefix}/${normalizedFileName}` : normalizedFileName;
   if (excludeRelativePaths.has(relativePath)) return null;
   const parentPath = joinTargetPath(sourceRoot, indexPrefix || "");
-  const lsjsonEntry = rcloneLsjsonFile(rcloneBin, parentPath, fileName);
+  const lsjsonEntry = rcloneLsjsonFile(rcloneBin, parentPath, normalizedFileName);
 
   if (!lsjsonEntry) {
     stats.index_files_missing += 1;
@@ -395,20 +472,23 @@ function scanIndexTree({
   sourceRoot,
   treeKey,
   indexPrefix,
+  treePath,
+  unitPattern,
+  maxDepth = 3,
   previousUnits,
   excludeRelativePaths,
   stats,
 }) {
-  const treePrefix = indexPrefix ? `${indexPrefix}/${treeKey}` : treeKey;
+  const normalizedTreePath = String(treePath || treeKey).trim();
+  const normalizedUnitPattern = unitPattern || INDEX_TREE_UNIT_PATTERN;
+  const treePrefix = indexPrefix ? `${indexPrefix}/${normalizedTreePath}` : normalizedTreePath;
   const treeSourcePath = joinTargetPath(sourceRoot, treePrefix);
-  // Tree unit manifests live at <tree>/day_utc=*/connector_id=*/manifest.json
-  // — depth 3.
-  const lsjsonEntries = rcloneLsjsonRecursive(rcloneBin, treeSourcePath, { maxDepth: 3 });
+  const lsjsonEntries = rcloneLsjsonRecursive(rcloneBin, treeSourcePath, { maxDepth });
 
   const units = {};
   for (const entry of lsjsonEntries) {
     const relPath = String(entry?.Path || "");
-    if (!INDEX_TREE_UNIT_PATTERN.test(relPath)) continue;
+    if (!normalizedUnitPattern.test(relPath)) continue;
     const unitRelativePath = `${treePrefix}/${relPath}`;
     if (excludeRelativePaths.has(unitRelativePath)) continue;
     stats.index_tree_units_listed += 1;
@@ -441,7 +521,96 @@ function scanIndexTree({
   return { treeKey, units };
 }
 
+function indexFileScanConfig(indexKey, args) {
+  if (indexKey === "observations_timeseries_v2_latest") {
+    return {
+      indexPrefix: args.index_v2_prefix,
+      fileName: "observations_timeseries_latest.json",
+    };
+  }
+  if (indexKey === "aqilevels_hourly_data_timeseries_v2_latest") {
+    return {
+      indexPrefix: args.index_v2_prefix,
+      fileName: "aqilevels_hourly_data_timeseries_latest.json",
+    };
+  }
+  return {
+    indexPrefix: args.index_prefix,
+    fileName: `${indexKey}.json`,
+  };
+}
+
+function indexTreeScanConfig(treeKey, args) {
+  if (treeKey === "observations_timeseries_v2") {
+    return {
+      indexPrefix: args.index_v2_prefix,
+      treePath: "observations_timeseries",
+      unitPattern: INDEX_TREE_UNIT_V2_PATTERN,
+      maxDepth: 4,
+    };
+  }
+  if (treeKey === "aqilevels_hourly_data_timeseries_v2") {
+    return {
+      indexPrefix: args.index_v2_prefix,
+      treePath: "aqilevels_hourly_data_timeseries",
+      unitPattern: INDEX_TREE_UNIT_V2_PATTERN,
+      maxDepth: 4,
+    };
+  }
+  return {
+    indexPrefix: args.index_prefix,
+    treePath: treeKey,
+    unitPattern: INDEX_TREE_UNIT_PATTERN,
+    maxDepth: 3,
+  };
+}
+
 // ---- Phase: committed per-(day, connector) observation manifests ----
+
+function scanRunManifests({
+  rcloneBin,
+  sourceRoot,
+  runsPrefix,
+  previousUnits,
+  excludeRelativePaths,
+  stats,
+}) {
+  const sourcePath = joinTargetPath(sourceRoot, runsPrefix);
+  const lsjsonEntries = rcloneLsjsonRecursive(rcloneBin, sourcePath, { maxDepth: 2 });
+  const units = {};
+  for (const entry of lsjsonEntries) {
+    const relPath = String(entry?.Path || "");
+    if (!isRunManifestUnitPath(relPath)) continue;
+    const unitRelativePath = `${runsPrefix}/${relPath}`;
+    if (excludeRelativePaths.has(unitRelativePath)) continue;
+    stats.run_manifest_units_listed += 1;
+
+    const currentMeta = extractLsjsonMetadata(entry);
+    recordMd5Availability(stats, currentMeta.has_md5);
+    const previousEntry = previousUnits?.[relPath] || null;
+    const prevMeta = previousMetadata(previousEntry, "size");
+    const reuseClass = previousEntry && previousEntry.hash
+      ? classifyReuse(currentMeta, prevMeta)
+      : null;
+
+    if (reuseClass) {
+      units[relPath] = { ...previousEntry };
+      stats.run_manifest_units_skipped += 1;
+      recordReuseOutcome(stats, reuseClass);
+      continue;
+    }
+
+    const unitSourcePath = joinTargetPath(sourceRoot, unitRelativePath);
+    const fileText = rcloneCat(rcloneBin, unitSourcePath);
+    stats.run_manifest_units_reread += 1;
+    units[relPath] = buildFileInventoryEntry({
+      relativePath: unitRelativePath,
+      fileText,
+      lsjsonEntry: entry,
+    });
+  }
+  return units;
+}
 
 function scanCommittedConnectorManifests({
   rcloneBin,
@@ -511,19 +680,38 @@ function buildDeterministicJson(inventory) {
   return `${JSON.stringify(sortObjectKeysDeep(inventory), null, 2)}\n`;
 }
 
-function computeSummary(inventory) {
+function computeSummary(inventory, { domainNames, indexTreeKeys }) {
   const domainDayCount = {};
-  for (const domain of DOMAIN_NAMES) {
-    domainDayCount[domain] = Object.keys(
-      inventory.domains?.[domain]?.days || {},
-    ).length;
+  const domainObjectCount = {};
+  const domainTotalBytes = {};
+  for (const domain of domainNames) {
+    const days = inventory.domains?.[domain]?.days || {};
+    domainDayCount[domain] = Object.keys(days).length;
+    domainObjectCount[domain] = 0;
+    domainTotalBytes[domain] = 0;
+    for (const entry of Object.values(days)) {
+      const fileCount = safeIntOrNull(entry?.file_count);
+      const totalBytes = safeIntOrNull(entry?.total_bytes);
+      if (fileCount !== null) domainObjectCount[domain] += fileCount;
+      if (totalBytes !== null) domainTotalBytes[domain] += totalBytes;
+    }
   }
   const indexFileCount = Object.keys(inventory.index_files || {}).length;
+  const indexFileBytes = Object.values(inventory.index_files || {}).reduce(
+    (sum, entry) => sum + (safeIntOrNull(entry?.size) ?? 0),
+    0,
+  );
   const indexTreeUnitCount = {};
-  for (const treeKey of INDEX_TREE_KEYS) {
+  const indexTreeUnitBytes = {};
+  for (const treeKey of indexTreeKeys) {
+    const units = inventory.index_tree_units?.[treeKey]?.units || {};
     indexTreeUnitCount[treeKey] = Object.keys(
-      inventory.index_tree_units?.[treeKey]?.units || {},
+      units,
     ).length;
+    indexTreeUnitBytes[treeKey] = Object.values(units).reduce(
+      (sum, entry) => sum + (safeIntOrNull(entry?.size) ?? 0),
+      0,
+    );
   }
   const committedConnectorUnitCount = {};
   for (const key of COMMITTED_CONNECTOR_UNIT_KEYS) {
@@ -531,11 +719,27 @@ function computeSummary(inventory) {
       inventory.committed_connector_units?.[key]?.units || {},
     ).length;
   }
+  const runManifestUnitCount = {};
+  const runManifestUnitBytes = {};
+  for (const key of RUN_MANIFEST_UNIT_KEYS) {
+    const units = inventory.run_manifest_units?.[key]?.units || {};
+    runManifestUnitCount[key] = Object.keys(units).length;
+    runManifestUnitBytes[key] = Object.values(units).reduce(
+      (sum, entry) => sum + (safeIntOrNull(entry?.size) ?? 0),
+      0,
+    );
+  }
   return {
     domain_day_count: domainDayCount,
+    domain_object_count: domainObjectCount,
+    domain_total_bytes: domainTotalBytes,
     index_file_count: indexFileCount,
+    index_file_bytes: indexFileBytes,
     index_tree_unit_count: indexTreeUnitCount,
+    index_tree_unit_bytes: indexTreeUnitBytes,
     committed_connector_unit_count: committedConnectorUnitCount,
+    run_manifest_unit_count: runManifestUnitCount,
+    run_manifest_unit_bytes: runManifestUnitBytes,
   };
 }
 
@@ -544,6 +748,29 @@ function computeSummary(inventory) {
 async function main() {
   const t0 = Date.now();
   const args = parseArgs(process.argv.slice(2));
+  const domainPrefixes = resolveDomainPrefixes(args.backup_version);
+  const defaultDomains = domainNamesForBackupVersion(args.backup_version);
+  const indexFileKeys = indexFileKeysForBackupVersion(args.backup_version);
+  const indexTreeKeys = indexTreeKeysForBackupVersion(args.backup_version);
+  const runsPrefix = args.runs_prefix || runManifestPrefixForBackupVersion(args.backup_version);
+
+  if (args.show_version) {
+    const selected = {
+      ok: true,
+      selected_backup_version: args.backup_version,
+      default_inventory_rel_path: defaultInventoryRelPathForBackupVersion(args.backup_version),
+      inventory_rel_path: args.inventory_rel_path,
+      default_domains: defaultDomains,
+      domain_prefixes: domainPrefixes,
+      index_prefix: args.index_prefix,
+      index_v2_prefix: args.index_v2_prefix,
+      runs_prefix: runsPrefix,
+      index_file_keys: indexFileKeys,
+      index_tree_keys: indexTreeKeys,
+    };
+    process.stdout.write(`${JSON.stringify(selected, null, 2)}\n`);
+    return;
+  }
 
   const previousInventory = args.full_rebuild
     ? null
@@ -553,26 +780,26 @@ async function main() {
   const inventory = {
     version: INVENTORY_SCHEMA_VERSION,
     kind: INVENTORY_KIND,
+    backup_version: args.backup_version,
     generated_at: new Date().toISOString(),
     source: {
+      backup_version: args.backup_version,
       index_prefix: args.index_prefix,
-      domain_prefixes: {
-        observations: DEFAULT_DOMAIN_PREFIXES.observations,
-        aqilevels: DEFAULT_DOMAIN_PREFIXES.aqilevels,
-        core: DEFAULT_DOMAIN_PREFIXES.core,
-      },
+      index_v2_prefix: args.index_v2_prefix,
+      runs_prefix: runsPrefix,
+      domain_prefixes: Object.fromEntries(
+        args.domains.map((domain) => [domain, domainPrefixes[domain] || null]),
+      ),
     },
-    domains: {
-      observations: { days: {} },
-      aqilevels: { days: {} },
-      core: { days: {} },
-    },
+    domains: Object.fromEntries(args.domains.map((domain) => [domain, { days: {} }])),
     index_files: {},
-    index_tree_units: {
-      observations_timeseries: { units: {} },
-      aqilevels_timeseries: { units: {} },
-    },
+    index_tree_units: Object.fromEntries(
+      indexTreeKeys.map((treeKey) => [treeKey, { units: {} }]),
+    ),
     committed_connector_units: {
+      observations: { units: {} },
+    },
+    run_manifest_units: {
       observations: { units: {} },
     },
     summary: {},
@@ -591,6 +818,9 @@ async function main() {
     committed_connector_units_listed: 0,
     committed_connector_units_reread: 0,
     committed_connector_units_skipped: 0,
+    run_manifest_units_listed: 0,
+    run_manifest_units_reread: 0,
+    run_manifest_units_skipped: 0,
     // MD5 availability per lsjson entry across all three categories.
     // r2_md5_missing_count > 0 means rclone didn't return Hashes.md5 for
     // some objects (despite --hash --hash-type MD5) — could be multipart-style
@@ -616,7 +846,7 @@ async function main() {
   // Phase: day folders per domain
   const tDays = Date.now();
   for (const domain of args.domains) {
-    const domainPrefix = DEFAULT_DOMAIN_PREFIXES[domain];
+    const domainPrefix = domainPrefixes[domain];
     if (!domainPrefix) {
       throw new Error(`No domain prefix configured for ${domain}`);
     }
@@ -637,13 +867,15 @@ async function main() {
 
   // Phase: latest index files (only included if present in R2)
   const tIndexFiles = Date.now();
-  for (const indexKey of INDEX_FILE_KEYS) {
+  for (const indexKey of indexFileKeys) {
     const previousEntry = previousInventory?.index_files?.[indexKey] || null;
+    const scanConfig = indexFileScanConfig(indexKey, args);
     const entry = scanIndexFile({
       rcloneBin: args.rclone_bin,
       sourceRoot: args.source_root,
       indexKey,
-      indexPrefix: args.index_prefix,
+      indexPrefix: scanConfig.indexPrefix,
+      fileName: scanConfig.fileName,
       previousEntry,
       excludeRelativePaths,
       stats,
@@ -656,14 +888,18 @@ async function main() {
 
   // Phase: timeseries index tree per-(day, connector) units
   const tTrees = Date.now();
-  for (const treeKey of INDEX_TREE_KEYS) {
+  for (const treeKey of indexTreeKeys) {
     const previousUnits =
       previousInventory?.index_tree_units?.[treeKey]?.units || {};
+    const scanConfig = indexTreeScanConfig(treeKey, args);
     const { units } = scanIndexTree({
       rcloneBin: args.rclone_bin,
       sourceRoot: args.source_root,
       treeKey,
-      indexPrefix: args.index_prefix,
+      indexPrefix: scanConfig.indexPrefix,
+      treePath: scanConfig.treePath,
+      unitPattern: scanConfig.unitPattern,
+      maxDepth: scanConfig.maxDepth,
       previousUnits,
       excludeRelativePaths,
       stats,
@@ -680,7 +916,7 @@ async function main() {
     const units = scanCommittedConnectorManifests({
       rcloneBin: args.rclone_bin,
       sourceRoot: args.source_root,
-      domainPrefix: DEFAULT_DOMAIN_PREFIXES.observations,
+      domainPrefix: domainPrefixes.observations,
       previousUnits,
       excludeRelativePaths,
       stats,
@@ -689,7 +925,26 @@ async function main() {
   }
   stats.elapsed_ms.committed_connector_units = Date.now() - tConnectorManifests;
 
-  inventory.summary = computeSummary(inventory);
+  const tRunManifests = Date.now();
+  if (args.domains.includes("observations")) {
+    const previousUnits =
+      previousInventory?.run_manifest_units?.observations?.units || {};
+    const units = scanRunManifests({
+      rcloneBin: args.rclone_bin,
+      sourceRoot: args.source_root,
+      runsPrefix,
+      previousUnits,
+      excludeRelativePaths,
+      stats,
+    });
+    inventory.run_manifest_units.observations = { units };
+  }
+  stats.elapsed_ms.run_manifest_units = Date.now() - tRunManifests;
+
+  inventory.summary = computeSummary(inventory, {
+    domainNames: args.domains,
+    indexTreeKeys,
+  });
 
   const inventoryJson = buildDeterministicJson(inventory);
   const inventoryHash = sha256Hex(inventoryJson);
@@ -720,7 +975,8 @@ async function main() {
     stats.manifests_reread
     + stats.index_files_reread
     + stats.index_tree_units_reread
-    + stats.committed_connector_units_reread;
+    + stats.committed_connector_units_reread
+    + stats.run_manifest_units_reread;
   const rereadFullRebuild = args.full_rebuild ? totalRereadAllCategories : 0;
   const rereadNewOrChanged = args.full_rebuild ? 0 : totalRereadAllCategories;
 
@@ -735,13 +991,34 @@ async function main() {
       + `exposing the etag for these objects.`,
     );
   }
+  const backupWarnings = [];
+  const missingDomainPrefixes = [];
+  if (args.backup_version === "v2") {
+    for (const domain of args.domains) {
+      const dayCount = inventory.summary.domain_day_count?.[domain] ?? 0;
+      if (dayCount > 0) continue;
+      const prefix = domainPrefixes[domain] || null;
+      missingDomainPrefixes.push({ domain, prefix });
+      backupWarnings.push(
+        `v2 backup domain ${domain} produced zero day manifests at ${prefix}; `
+        + `if this domain has not been written yet, the v2 Dropbox backup will omit it until it exists.`,
+      );
+    }
+  }
 
   const report = {
     ok: true,
+    selected_backup_version: args.backup_version,
     first_build: firstBuild,
     dry_run: args.dry_run,
     full_rebuild: args.full_rebuild,
     inventory_rel_path: args.inventory_rel_path,
+    domain_prefixes: Object.fromEntries(
+      args.domains.map((domain) => [domain, domainPrefixes[domain] || null]),
+    ),
+    index_prefix: args.index_prefix,
+    index_v2_prefix: args.index_v2_prefix,
+    runs_prefix: runsPrefix,
     inventory_size: Buffer.byteLength(inventoryJson, "utf8"),
     inventory_hash: inventoryHash,
     generated_at: inventory.generated_at,
@@ -761,12 +1038,17 @@ async function main() {
     committed_connector_units_listed: stats.committed_connector_units_listed,
     committed_connector_units_reread: stats.committed_connector_units_reread,
     committed_connector_units_skipped: stats.committed_connector_units_skipped,
+    run_manifest_units_listed: stats.run_manifest_units_listed,
+    run_manifest_units_reread: stats.run_manifest_units_reread,
+    run_manifest_units_skipped: stats.run_manifest_units_skipped,
     r2_md5_available_count: stats.r2_md5_available_count,
     r2_md5_missing_count: stats.r2_md5_missing_count,
     reuse_by_r2_md5_size: stats.reuse_by_r2_md5_size,
     reuse_by_size_modtime: stats.reuse_by_size_modtime,
     r2_md5_metadata_available: r2Md5Available,
     metadata_warnings: metadataWarnings,
+    backup_warnings: backupWarnings,
+    missing_domain_prefixes: missingDomainPrefixes,
     elapsed_ms: stats.elapsed_ms,
     summary: inventory.summary,
   };
@@ -775,10 +1057,17 @@ async function main() {
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(
-    `${JSON.stringify({ ok: false, error: message }, null, 2)}\n`,
-  );
-  process.exit(1);
-});
+function isMainModule(moduleUrl) {
+  if (!process.argv[1]) return false;
+  return path.resolve(process.argv[1]) === fileURLToPath(moduleUrl);
+}
+
+if (isMainModule(import.meta.url)) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(
+      `${JSON.stringify({ ok: false, error: message }, null, 2)}\n`,
+    );
+    process.exit(1);
+  });
+}
