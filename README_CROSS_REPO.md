@@ -1,7 +1,7 @@
 # Cross-repo map: LIVE-uk-aq-ops
 
 ## Main repo
-- `LIVE-uk-aq-ingest` is the main repo for this project and the default starting point for cross-repo tasks.
+- `LIVE-uk-aq-ops` is the main repo for this project and the default starting point for cross-repo tasks.
 
 ## Purpose
 This repo runs UK AQ operational Cloud Run services (prune, outbox, partition maintenance, DB size logging, and backfill) and related deployment/setup documentation.
@@ -33,7 +33,8 @@ This repo runs UK AQ operational Cloud Run services (prune, outbox, partition ma
 - `system_docs/`
 
 ## Conventions
-- Project-wide naming conventions live in ingest repo `AGENTS.md`.
+- Project-wide agent notes live in this repo's `AGENTS.md`.
+- Ingest-specific naming conventions remain documented in the ingest repo `AGENTS.md`.
 - Schema DDL canonical location is schema repo under `schemas/`.
 
 ## Permissions (REQUIRED)
@@ -43,7 +44,8 @@ This repo runs UK AQ operational Cloud Run services (prune, outbox, partition ma
 - Existing README: `README.md`
 - Ingest repo (sibling): `../LIVE-uk-aq-ingest`
 - Schema repo (sibling): `../LIVE-uk-aq-schema`
-- Naming conventions (ingest repo): `../LIVE-uk-aq-ingest/AGENTS.md`
+- Main project agent notes: `AGENTS.md`
+- Ingest-specific naming conventions: `../LIVE-uk-aq-ingest/AGENTS.md`
 
 ## WORKING STYLE (IMPORTANT)
 
