@@ -23,14 +23,8 @@ type DashboardPayload = {
   r2_backup_window_error: string | null;
   r2_history_days_bucket: string | null;
   r2_history_days_error: string | null;
-  r2_history_read_version: R2HistoryReadVersionResolution;
   dropbox_backup_state_path: string | null;
   dropbox_backup_state_error: string | null;
-  dropbox_backup_state_source: string | null;
-  dropbox_backup_state_attempted_paths: string[];
-  dropbox_backup_state_cache_key: string | null;
-  dropbox_backup_state_warning: string | null;
-  dropbox_backup_state_fallback_attempted: boolean;
   storage_coverage_source: string;
   storage_coverage_days: unknown[];
   pollutants: unknown[];
@@ -44,25 +38,6 @@ type PostgrestSchema = "uk_aq_core" | "uk_aq_public" | "uk_aq_ops";
 type R2DaySets = {
   observations: Set<string>;
   aqilevels: Set<string>;
-};
-
-type R2HistoryReadVersionResolution = {
-  version: "v1" | "v2" | null;
-  label: string;
-  source: "env" | "default_missing_env" | "invalid_env";
-  warning: string | null;
-  valid: boolean;
-  raw: string;
-};
-
-type DropboxStatePathResolution = {
-  path: string;
-  attemptedPaths: string[];
-  source: string;
-  cacheKey: string;
-  warning: string | null;
-  fallbackAttempted: boolean;
-  readVersion: R2HistoryReadVersionResolution;
 };
 
 const BUCKETS = ["0-3 Hours", "3-6 Hours", "6-24 Hours", "1 - 7 Days", "Older than 7 Days"] as const;
@@ -118,14 +93,6 @@ const R2_FREE_ACTION_TYPES = new Set([
   "DeleteBucket",
   "AbortMultipartUpload",
 ]);
-const R2_HISTORY_READ_VERSION_ENV = "UK_AQ_R2_HISTORY_READ_VERSION";
-const R2_HISTORY_READ_VERSION_DEFAULT: "v1" = "v1";
-const R2_HISTORY_READ_VERSION_ACCEPTED = new Set(["v1", "v2"]);
-const R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS = {
-  v1: "_ops/checkpoints/r2_history_backup_state_v1.json",
-  v2: "_ops/checkpoints/r2_history_backup_state_v2.json",
-} as const;
-
 const R2_OPS_GQL_QUERY = `
 query R2OpsMonth($accountTag: string!, $startDate: Time!, $endDate: Time!) {
   viewer {
@@ -155,63 +122,10 @@ type CacheEntry<T> = {
 };
 
 const dashboardCache = new Map<string, CacheEntry<DashboardPayload>>();
-let storageCoverageCache: CacheEntry<{
-  generated_at: string;
-  storage_coverage_source: string;
-  storage_coverage_days: unknown[];
-  r2_history_read_version: R2HistoryReadVersionResolution;
-  dropbox_backup_state_path: string | null;
-  dropbox_backup_state_error: string | null;
-  dropbox_backup_state_source: string | null;
-  dropbox_backup_state_attempted_paths: string[];
-  dropbox_backup_state_cache_key: string | null;
-  dropbox_backup_state_warning: string | null;
-  dropbox_backup_state_fallback_attempted: boolean;
-}> | null = null;
+let storageCoverageCache: CacheEntry<{ generated_at: string; storage_coverage_source: string; storage_coverage_days: unknown[] }> | null = null;
 let r2UsageCache: CacheEntry<{ usage: JsonObject | null; error: string | null }> | null = null;
-let r2HistoryDaysCache: CacheEntry<{ daySets: R2DaySets | null; window: JsonObject | null; bucket: string | null; error: string | null; readVersion: R2HistoryReadVersionResolution }> | null = null;
-let r2HistoryDaysCacheVersionKey: string | null = null;
-let storageCoverageCacheVersionKey: string | null = null;
+let r2HistoryDaysCache: CacheEntry<{ daySets: R2DaySets | null; window: JsonObject | null; bucket: string | null; error: string | null }> | null = null;
 let dropboxMtimeCache: CacheEntry<{ payload: JsonObject; error: string | null }> | null = null;
-
-function resolveR2HistoryReadVersion(env: WorkerEnv): R2HistoryReadVersionResolution {
-  const raw = String(env.UK_AQ_R2_HISTORY_READ_VERSION || "").trim();
-  const normalized = raw.toLowerCase();
-  if (!normalized) {
-    return {
-      version: R2_HISTORY_READ_VERSION_DEFAULT,
-      label: `R2_${R2_HISTORY_READ_VERSION_DEFAULT}`,
-      source: "default_missing_env",
-      warning: `${R2_HISTORY_READ_VERSION_ENV} is not set; defaulting to ${R2_HISTORY_READ_VERSION_DEFAULT} to preserve existing dashboard behaviour.`,
-      valid: true,
-      raw,
-    };
-  }
-  if (R2_HISTORY_READ_VERSION_ACCEPTED.has(normalized)) {
-    return { version: normalized as "v1" | "v2", label: `R2_${normalized}`, source: "env", warning: null, valid: true, raw };
-  }
-  return {
-    version: null,
-    label: "R2 invalid",
-    source: "invalid_env",
-    warning: `Invalid ${R2_HISTORY_READ_VERSION_ENV}=${JSON.stringify(raw)}; expected v1 or v2. R2 history checks are disabled until this is fixed.`,
-    valid: false,
-    raw,
-  };
-}
-
-function r2HistoryReadVersionCacheKey(env: WorkerEnv): string {
-  const resolved = resolveR2HistoryReadVersion(env);
-  return `${resolved.valid ? resolved.version : "invalid"}:${resolved.raw}`;
-}
-
-function addR2HistoryReadVersionParam(params: Record<string, string>, env: WorkerEnv): Record<string, string> {
-  const resolved = resolveR2HistoryReadVersion(env);
-  if (!resolved.valid || !resolved.version) {
-    throw new Error(resolved.warning || "Invalid R2 history read version");
-  }
-  return { ...params, read_version: resolved.version };
-}
 
 function readNumber(value: unknown, fallback: number): number {
   const parsed = Number(value);
@@ -659,9 +573,8 @@ function buildR2Window(daySets: R2DaySets): JsonObject {
 async function fetchR2HistoryDays(
   env: WorkerEnv,
   forceRefresh = false,
-): Promise<{ daySets: R2DaySets | null; window: JsonObject | null; bucket: string | null; error: string | null; readVersion: R2HistoryReadVersionResolution }> {
-  const versionCacheKey = r2HistoryReadVersionCacheKey(env);
-  if (!forceRefresh && r2HistoryDaysCacheVersionKey === versionCacheKey) {
+): Promise<{ daySets: R2DaySets | null; window: JsonObject | null; bucket: string | null; error: string | null }> {
+  if (!forceRefresh) {
     const cached = cacheGet(r2HistoryDaysCache);
     if (cached) {
       return cached;
@@ -675,9 +588,7 @@ async function fetchR2HistoryDays(
       window: null,
       bucket: null,
       error: "R2 history-days API not configured",
-      readVersion: resolveR2HistoryReadVersion(env),
     };
-    r2HistoryDaysCacheVersionKey = versionCacheKey;
     r2HistoryDaysCache = { value: fallback, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
     return fallback;
   }
@@ -691,7 +602,7 @@ async function fetchR2HistoryDays(
   const maxDays = Math.max(1, Math.min(3660, Math.trunc(readNumber(env.UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS, 3660))));
   try {
     const payload = await fetchJsonObject(
-      appendQueryParams(apiUrl, addR2HistoryReadVersionParam({ max_days: String(maxDays) }, env)),
+      appendQueryParams(apiUrl, { max_days: String(maxDays) }),
       { method: "GET", headers },
       "R2 history-days API",
     );
@@ -701,9 +612,7 @@ async function fetchR2HistoryDays(
       window: buildR2Window(daySets),
       bucket: String(payload.bucket || "").trim() || null,
       error: null,
-      readVersion: resolveR2HistoryReadVersion(env),
     };
-    r2HistoryDaysCacheVersionKey = versionCacheKey;
     r2HistoryDaysCache = { value, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
     return value;
   } catch (err) {
@@ -712,9 +621,7 @@ async function fetchR2HistoryDays(
       window: null,
       bucket: null,
       error: err instanceof Error ? err.message : String(err),
-      readVersion: resolveR2HistoryReadVersion(env),
     };
-    r2HistoryDaysCacheVersionKey = versionCacheKey;
     r2HistoryDaysCache = { value, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
     return value;
   }
@@ -1136,66 +1043,13 @@ function latestOldestDay(rows: unknown[], selector: (row: JsonObject) => boolean
   return latestDay;
 }
 
-function joinDropboxStatePath(env: WorkerEnv, stateRel: string): string {
+function resolveDropboxStatePath(env: WorkerEnv): string {
   const root = String(env.UK_AQ_DROPBOX_ROOT || "CIC-Test").trim().replace(/^\/+|\/+$/g, "");
   const historyDir = String(env.UK_AQ_R2_HISTORY_DROPBOX_DIR || "R2_history_backup").trim().replace(/^\/+|\/+$/g, "");
-  const normalizedStateRel = stateRel.trim().replace(/^\/+|\/+$/g, "");
-  const parts = [root, historyDir, normalizedStateRel].filter((part) => part.length > 0);
-  if (!parts.length) {
-    return "";
-  }
-  return `/${parts.join("/")}`;
-}
-
-function looksLikeV1DropboxStatePath(stateRel: string): boolean {
-  const normalized = stateRel.trim().toLowerCase();
-  return /(^|[/_-])v1([/_-]|\.json$)/.test(normalized) || normalized.includes("history/v1/");
-}
-
-function resolveDropboxStatePath(env: WorkerEnv): DropboxStatePathResolution {
-  const readVersion = resolveR2HistoryReadVersion(env);
-  if (!readVersion.valid || !readVersion.version) {
-    return {
-      path: "",
-      attemptedPaths: [],
-      source: "disabled_invalid_r2_history_read_version",
-      cacheKey: `dropbox:${r2HistoryReadVersionCacheKey(env)}:disabled`,
-      warning: readVersion.warning || "Invalid R2 history read version.",
-      fallbackAttempted: false,
-      readVersion,
-    };
-  }
-  const configuredRel = String(env.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || "").trim().replace(/^\/+|\/+$/g, "");
-  let stateRel = configuredRel || R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS[readVersion.version];
-  let source = configuredRel ? "env:UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH" : `default:${readVersion.version}`;
-  let warning: string | null = null;
-  if (readVersion.version === "v2" && configuredRel && looksLikeV1DropboxStatePath(configuredRel)) {
-    stateRel = R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS.v2;
-    source = "default:v2_ignored_v1_env_override";
-    warning = "Ignored UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH because active R2 history read version is v2 and the configured Dropbox checkpoint path points at v1.";
-  }
-  const path = joinDropboxStatePath(env, stateRel);
-  const attemptedPaths = path ? [`dropbox:${path}`] : [];
-  return {
-    path,
-    attemptedPaths,
-    source,
-    cacheKey: `dropbox:${r2HistoryReadVersionCacheKey(env)}:${path || "none"}`,
-    warning,
-    fallbackAttempted: false,
-    readVersion,
-  };
-}
-
-function storageCoverageCacheKey(env: WorkerEnv): string {
-  const dropboxStatePath = resolveDropboxStatePath(env);
-  return `storage_coverage:${r2HistoryReadVersionCacheKey(env)}:${dropboxStatePath.cacheKey}`;
-}
-
-function resolveDropboxHistoryPath(env: WorkerEnv): string {
-  const root = String(env.UK_AQ_DROPBOX_ROOT || "CIC-Test").trim().replace(/^\/+|\/+$/g, "");
-  const historyDir = String(env.UK_AQ_R2_HISTORY_DROPBOX_DIR || "R2_history_backup").trim().replace(/^\/+|\/+$/g, "");
-  const parts = [root, historyDir].filter((part) => part.length > 0);
+  const stateRel = String(env.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || "_ops/checkpoints/r2_history_backup_state_v1.json")
+    .trim()
+    .replace(/^\/+|\/+$/g, "");
+  const parts = [root, historyDir, stateRel].filter((part) => part.length > 0);
   if (!parts.length) {
     return "";
   }
@@ -1239,54 +1093,17 @@ async function fetchDropboxAccessToken(env: WorkerEnv): Promise<{ token: string 
   }
 }
 
-async function fetchDropboxStateJson(env: WorkerEnv): Promise<{
-  state: JsonObject | null;
-  path: string | null;
-  error: string | null;
-  source: string;
-  attemptedPaths: string[];
-  cacheKey: string;
-  warning: string | null;
-  fallbackAttempted: boolean;
-}> {
-  const resolvedPath = resolveDropboxStatePath(env);
-  const remotePath = resolvedPath.path;
+async function fetchDropboxStateJson(env: WorkerEnv): Promise<{ state: JsonObject | null; path: string | null; error: string | null }> {
+  const remotePath = resolveDropboxStatePath(env);
   if (!remotePath) {
-    return {
-      state: null,
-      path: null,
-      error: null,
-      source: resolvedPath.source,
-      attemptedPaths: resolvedPath.attemptedPaths,
-      cacheKey: resolvedPath.cacheKey,
-      warning: resolvedPath.warning,
-      fallbackAttempted: resolvedPath.fallbackAttempted,
-    };
+    return { state: null, path: null, error: null };
   }
   const { token, error: tokenError } = await fetchDropboxAccessToken(env);
   if (tokenError) {
-    return {
-      state: null,
-      path: `dropbox:${remotePath}`,
-      error: tokenError,
-      source: resolvedPath.source,
-      attemptedPaths: resolvedPath.attemptedPaths,
-      cacheKey: resolvedPath.cacheKey,
-      warning: resolvedPath.warning,
-      fallbackAttempted: resolvedPath.fallbackAttempted,
-    };
+    return { state: null, path: `dropbox:${remotePath}`, error: tokenError };
   }
   if (!token) {
-    return {
-      state: null,
-      path: null,
-      error: null,
-      source: resolvedPath.source,
-      attemptedPaths: resolvedPath.attemptedPaths,
-      cacheKey: resolvedPath.cacheKey,
-      warning: resolvedPath.warning,
-      fallbackAttempted: resolvedPath.fallbackAttempted,
-    };
+    return { state: null, path: null, error: null };
   }
   const headers = new Headers();
   headers.set("Authorization", `Bearer ${token}`);
@@ -1298,51 +1115,15 @@ async function fetchDropboxStateJson(env: WorkerEnv): Promise<{
     });
     const text = await response.text();
     if (!response.ok) {
-      return {
-        state: null,
-        path: `dropbox:${remotePath}`,
-        error: `Dropbox checkpoint download failed (${response.status}): ${text}`,
-        source: resolvedPath.source,
-        attemptedPaths: resolvedPath.attemptedPaths,
-        cacheKey: resolvedPath.cacheKey,
-        warning: resolvedPath.warning,
-        fallbackAttempted: resolvedPath.fallbackAttempted,
-      };
+      return { state: null, path: `dropbox:${remotePath}`, error: `Dropbox checkpoint download failed (${response.status}): ${text}` };
     }
     const parsed = text ? JSON.parse(text) : null;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return {
-        state: null,
-        path: `dropbox:${remotePath}`,
-        error: "Dropbox checkpoint payload is not a JSON object.",
-        source: resolvedPath.source,
-        attemptedPaths: resolvedPath.attemptedPaths,
-        cacheKey: resolvedPath.cacheKey,
-        warning: resolvedPath.warning,
-        fallbackAttempted: resolvedPath.fallbackAttempted,
-      };
+      return { state: null, path: `dropbox:${remotePath}`, error: "Dropbox checkpoint payload is not a JSON object." };
     }
-    return {
-      state: parsed as JsonObject,
-      path: `dropbox:${remotePath}`,
-      error: null,
-      source: resolvedPath.source,
-      attemptedPaths: resolvedPath.attemptedPaths,
-      cacheKey: resolvedPath.cacheKey,
-      warning: resolvedPath.warning,
-      fallbackAttempted: resolvedPath.fallbackAttempted,
-    };
+    return { state: parsed as JsonObject, path: `dropbox:${remotePath}`, error: null };
   } catch (err) {
-    return {
-      state: null,
-      path: `dropbox:${remotePath}`,
-      error: err instanceof Error ? err.message : String(err),
-      source: resolvedPath.source,
-      attemptedPaths: resolvedPath.attemptedPaths,
-      cacheKey: resolvedPath.cacheKey,
-      warning: resolvedPath.warning,
-      fallbackAttempted: resolvedPath.fallbackAttempted,
-    };
+    return { state: null, path: `dropbox:${remotePath}`, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -1833,11 +1614,6 @@ async function fetchDashboardBaseData(
   let r2_history_days_error: string | null = null;
   let dropbox_backup_state_path: string | null = null;
   let dropbox_backup_state_error: string | null = null;
-  let dropbox_backup_state_source: string | null = null;
-  let dropbox_backup_state_attempted_paths: string[] = [];
-  let dropbox_backup_state_cache_key: string | null = null;
-  let dropbox_backup_state_warning: string | null = null;
-  let dropbox_backup_state_fallback_attempted = false;
   let storage_coverage_days: unknown[] = [];
 
   if (options.includeMetricContext || options.includeStorageCoverage) {
@@ -1863,11 +1639,6 @@ async function fetchDashboardBaseData(
     r2_backup_window = r2History.window;
     dropbox_backup_state_path = dropboxState.path;
     dropbox_backup_state_error = dropboxState.error;
-    dropbox_backup_state_source = dropboxState.source;
-    dropbox_backup_state_attempted_paths = dropboxState.attemptedPaths;
-    dropbox_backup_state_cache_key = dropboxState.cacheKey;
-    dropbox_backup_state_warning = dropboxState.warning;
-    dropbox_backup_state_fallback_attempted = dropboxState.fallbackAttempted;
     if (!r2_backup_window) {
       const fallbackWindow = await fetchR2BackupWindowFromSupabase(env);
       r2_backup_window = fallbackWindow.window;
@@ -1926,14 +1697,8 @@ async function fetchDashboardBaseData(
     r2_history_days_error,
     dropbox_backup_state_path,
     dropbox_backup_state_error,
-    dropbox_backup_state_source,
-    dropbox_backup_state_attempted_paths,
-    dropbox_backup_state_cache_key,
-    dropbox_backup_state_warning,
-    dropbox_backup_state_fallback_attempted,
     storage_coverage_source: "live_per_day_presence",
     storage_coverage_days,
-    r2_history_read_version: resolveR2HistoryReadVersion(env),
     pollutants: pollutantsPayload,
     dispatch_runs: dispatchRuns,
     dispatcher_settings: dispatcherSettings,
@@ -1941,12 +1706,11 @@ async function fetchDashboardBaseData(
   };
 }
 
-function dashboardCacheKey(search: URLSearchParams, env: WorkerEnv): string {
+function dashboardCacheKey(search: URLSearchParams): string {
   const includeStorage = asBoolFlag(search.get("include_storage_coverage"), true) ? "1" : "0";
   const includeMetric = asBoolFlag(search.get("include_metric_context"), true) ? "1" : "0";
   const includeIngest = asBoolFlag(search.get("include_ingest_context"), true) ? "1" : "0";
-  const storageKey = includeStorage === "1" ? storageCoverageCacheKey(env) : "storage_coverage:disabled";
-  return `storage=${includeStorage}|metric=${includeMetric}|ingest=${includeIngest}|${storageKey}`;
+  return `storage=${includeStorage}|metric=${includeMetric}|ingest=${includeIngest}`;
 }
 
 export async function getDirectDashboardPayload(
@@ -1954,7 +1718,7 @@ export async function getDirectDashboardPayload(
   search: URLSearchParams,
 ): Promise<DashboardPayload> {
   const forceRefresh = asTruthy(search.get("force"));
-  const cacheKey = dashboardCacheKey(search, env);
+  const cacheKey = dashboardCacheKey(search);
   if (!forceRefresh) {
     const cached = dashboardCache.get(cacheKey);
     if (cached && Date.now() <= cached.expiresAt) {
@@ -1976,22 +1740,9 @@ export async function getDirectDashboardPayload(
 export async function getDirectStorageCoveragePayload(
   env: WorkerEnv,
   search: URLSearchParams,
-): Promise<{
-  generated_at: string;
-  storage_coverage_source: string;
-  storage_coverage_days: unknown[];
-  r2_history_read_version: R2HistoryReadVersionResolution;
-  dropbox_backup_state_path: string | null;
-  dropbox_backup_state_error: string | null;
-  dropbox_backup_state_source: string | null;
-  dropbox_backup_state_attempted_paths: string[];
-  dropbox_backup_state_cache_key: string | null;
-  dropbox_backup_state_warning: string | null;
-  dropbox_backup_state_fallback_attempted: boolean;
-}> {
+): Promise<{ generated_at: string; storage_coverage_source: string; storage_coverage_days: unknown[] }> {
   const forceRefresh = asTruthy(search.get("force"));
-  const cacheKey = storageCoverageCacheKey(env);
-  if (!forceRefresh && storageCoverageCacheVersionKey === cacheKey) {
+  if (!forceRefresh) {
     const cached = cacheGet(storageCoverageCache);
     if (cached) {
       return cached;
@@ -2008,16 +1759,7 @@ export async function getDirectStorageCoveragePayload(
     generated_at: nowIso(),
     storage_coverage_source: payload.storage_coverage_source,
     storage_coverage_days: Array.isArray(payload.storage_coverage_days) ? payload.storage_coverage_days : [],
-    r2_history_read_version: payload.r2_history_read_version || resolveR2HistoryReadVersion(env),
-    dropbox_backup_state_path: payload.dropbox_backup_state_path || null,
-    dropbox_backup_state_error: payload.dropbox_backup_state_error || null,
-    dropbox_backup_state_source: payload.dropbox_backup_state_source || null,
-    dropbox_backup_state_attempted_paths: payload.dropbox_backup_state_attempted_paths || [],
-    dropbox_backup_state_cache_key: payload.dropbox_backup_state_cache_key || null,
-    dropbox_backup_state_warning: payload.dropbox_backup_state_warning || null,
-    dropbox_backup_state_fallback_attempted: payload.dropbox_backup_state_fallback_attempted || false,
   };
-  storageCoverageCacheVersionKey = cacheKey;
   storageCoverageCache = { value: response, expiresAt: Date.now() + STORAGE_COVERAGE_TTL_MS };
   return response;
 }
@@ -2046,7 +1788,6 @@ export async function getDirectR2MetricsPayload(
     r2_usage_error: r2Usage.error,
     r2_backup_window: window,
     r2_backup_window_error: windowError,
-    r2_history_read_version: r2History.readVersion,
     r2_history_days_bucket: r2History.bucket,
     r2_history_days_error: r2History.error,
     generated_at: nowIso(),
@@ -2067,14 +1808,13 @@ export async function getDirectR2ConnectorCountsPayload(
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
-  let params: Record<string, string> = {};
+  const params: Record<string, string> = {};
   for (const key of ["from_day", "to_day", "grain", "connector_ids"] as const) {
     const value = String(search.get(key) || "").trim();
     if (value) {
       params[key] = value;
     }
   }
-  params = addR2HistoryReadVersionParam(params, env);
   return fetchJsonObject(appendQueryParams(apiUrl, params), { method: "GET", headers }, "R2 history-counts API");
 }
 
@@ -2125,8 +1865,8 @@ export async function getDirectDropboxMtimePayload(
       };
     }
   }
-  const remotePath = resolveDropboxStatePath(env).path;
-  const resolvedHistoryPath = resolveDropboxHistoryPath(env);
+  const remotePath = resolveDropboxStatePath(env);
+  const resolvedHistoryPath = remotePath.replace(/\/_ops\/checkpoints\/r2_history_backup_state_v1\.json$/i, "").replace(/\/[^/]+$/, "");
   const { token, error: tokenError } = await fetchDropboxAccessToken(env);
   if (tokenError) {
     const payload = {
