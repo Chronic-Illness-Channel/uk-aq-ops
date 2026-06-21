@@ -122,8 +122,7 @@ async function ensureParquetTooling() {
 
 export const DEFAULT_R2_HISTORY_INDEX_PREFIX = "history/_index";
 export const DEFAULT_R2_HISTORY_OBSERVATIONS_PREFIX = "history/v1/observations";
-export const DEFAULT_R2_HISTORY_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly";
-export const DEFAULT_R2_HISTORY_V2_INDEX_PREFIX = "history/_index_v2";
+export const DEFAULT_R2_HISTORY_AQILEVELS_PREFIX = "history/v1/aqilevels";
 export const DEFAULT_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX =
   "history/_index/observations_timeseries";
 export const DEFAULT_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX =
@@ -333,16 +332,6 @@ export function buildR2HistoryObservationsTimeseriesLatestKey(indexPrefix) {
 export function buildR2HistoryAqilevelsTimeseriesLatestKey(indexPrefix) {
   const prefix = normalizePrefix(indexPrefix || DEFAULT_R2_HISTORY_INDEX_PREFIX);
   return `${prefix}/aqilevels_timeseries_latest.json`;
-}
-
-export function buildR2HistoryV2ObservationsTimeseriesLatestKey(indexPrefix) {
-  const prefix = normalizePrefix(indexPrefix || DEFAULT_R2_HISTORY_V2_INDEX_PREFIX);
-  return `${prefix}/observations_timeseries_latest.json`;
-}
-
-export function buildR2HistoryV2AqilevelsHourlyDataTimeseriesLatestKey(indexPrefix) {
-  const prefix = normalizePrefix(indexPrefix || DEFAULT_R2_HISTORY_V2_INDEX_PREFIX);
-  return `${prefix}/aqilevels_hourly_data_timeseries_latest.json`;
 }
 
 export function buildR2HistoryObservationsTimeseriesConnectorIndexKey(
