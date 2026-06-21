@@ -77,9 +77,6 @@ R2_HISTORY_COUNTS_API_URL = str(os.getenv("UK_AQ_R2_HISTORY_COUNTS_API_URL") or 
 R2_HISTORY_COUNTS_API_TOKEN = str(
     os.getenv("UK_AQ_R2_HISTORY_COUNTS_API_TOKEN") or R2_HISTORY_DAYS_API_TOKEN
 ).strip()
-R2_HISTORY_READ_VERSION_ENV = "UK_AQ_R2_HISTORY_READ_VERSION"
-R2_HISTORY_READ_VERSION_DEFAULT = "v1"
-R2_HISTORY_READ_VERSION_ACCEPTED = {"v1", "v2"}
 try:
     _raw_r2_history_days_max = int(str(os.getenv("UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS", "3660")).strip())
 except ValueError:
@@ -96,12 +93,13 @@ UK_AQ_DROPBOX_APP_FOLDER = str(os.getenv("UK_AQ_DROPBOX_APP_FOLDER") or "").stri
 UK_AQ_R2_HISTORY_DROPBOX_DIR = str(
     os.getenv("UK_AQ_R2_HISTORY_DROPBOX_DIR") or "R2_history_backup"
 ).strip()
-UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH_ENV = "UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH"
-R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS = {
-    "v1": "_ops/checkpoints/r2_history_backup_state_v1.json",
-    "v2": "_ops/checkpoints/r2_history_backup_state_v2.json",
-}
-UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE_ENV = "UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE"
+UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH = str(
+    os.getenv("UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH")
+    or "_ops/checkpoints/r2_history_backup_state_v1.json"
+).strip()
+UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE = str(
+    os.getenv("UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE") or ""
+).strip()
 DROPBOX_APP_KEY = str(os.getenv("DROPBOX_APP_KEY") or "").strip()
 DROPBOX_APP_SECRET = str(os.getenv("DROPBOX_APP_SECRET") or "").strip()
 DROPBOX_REFRESH_TOKEN = str(os.getenv("DROPBOX_REFRESH_TOKEN") or "").strip()
@@ -136,14 +134,7 @@ R2_HISTORY_DAYS_CACHE_STATE: Dict[str, Any] = {
     "error": None,
     "generated_at": None,
 }
-STORAGE_COVERAGE_CACHE_STATE: Dict[str, Any] = {
-    "rows": None,
-    "next_refresh_at": None,
-    "cache_key": None,
-    "dropbox_state_path": None,
-    "dropbox_state_error": None,
-    "dropbox_state_info": None,
-}
+STORAGE_COVERAGE_CACHE_STATE: Dict[str, Any] = {"rows": None, "next_refresh_at": None}
 DROPBOX_HISTORY_MTIME_CACHE_STATE: Dict[str, Any] = {
     "payload": None,
     "error": None,
@@ -373,125 +364,6 @@ def _project_ref_from_base_url(base_url: str) -> Optional[str]:
 def _request_path(url: str) -> str:
     parsed = urlparse(url)
     return parsed.path or url
-
-
-def _resolve_r2_history_read_version() -> Dict[str, Any]:
-    raw = str(os.getenv(R2_HISTORY_READ_VERSION_ENV) or "").strip()
-    normalized = raw.lower()
-    if not normalized:
-        return {
-            "version": R2_HISTORY_READ_VERSION_DEFAULT,
-            "label": f"R2_{R2_HISTORY_READ_VERSION_DEFAULT}",
-            "source": "default_missing_env",
-            "warning": f"{R2_HISTORY_READ_VERSION_ENV} is not set; defaulting to {R2_HISTORY_READ_VERSION_DEFAULT} to preserve existing dashboard behaviour.",
-            "valid": True,
-            "raw": raw,
-        }
-    if normalized in R2_HISTORY_READ_VERSION_ACCEPTED:
-        return {
-            "version": normalized,
-            "label": f"R2_{normalized}",
-            "source": "env",
-            "warning": None,
-            "valid": True,
-            "raw": raw,
-        }
-    return {
-        "version": None,
-        "label": "R2 invalid",
-        "source": "invalid_env",
-        "warning": f"Invalid {R2_HISTORY_READ_VERSION_ENV}={raw!r}; expected v1 or v2. R2 history checks are disabled until this is fixed.",
-        "valid": False,
-        "raw": raw,
-    }
-
-
-def _looks_like_v1_dropbox_state_path(value: str) -> bool:
-    normalized = value.lower()
-    return "v1" in normalized and "v2" not in normalized
-
-
-def _resolve_dropbox_state_path_info() -> Dict[str, Any]:
-    read_version_info = _resolve_r2_history_read_version()
-    if not read_version_info.get("valid"):
-        warning = str(
-            read_version_info.get("warning")
-            or "Invalid R2 history read version; Dropbox checkpoint selection disabled."
-        )
-        return {
-            "path": None,
-            "source": "disabled_invalid_read_version",
-            "cache_key": f"invalid:{read_version_info.get('raw') or ''}:dropbox_disabled",
-            "warning": warning,
-            "error": warning,
-            "fallback_attempted": False,
-            "read_version": read_version_info,
-            "attempted_paths": [],
-            "state_file_override": None,
-            "ignored_state_file_override": None,
-        }
-
-    version = str(read_version_info.get("version") or R2_HISTORY_READ_VERSION_DEFAULT)
-    raw_env = str(os.getenv(UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH_ENV) or "").strip()
-    state_file_override = str(os.getenv(UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE_ENV) or "").strip()
-
-    fallback_attempted = False
-    warnings: List[str] = []
-    source = "default"
-    attempted_paths: List[str] = []
-    ignored_state_file_override: Optional[str] = None
-
-    if raw_env:
-        source = "env"
-        attempted_paths.append(raw_env)
-        if version == "v2" and _looks_like_v1_dropbox_state_path(raw_env):
-            path = R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS["v2"]
-            source = "default:v2_ignored_v1_env_override"
-            warnings.append(
-                f"{R2_HISTORY_READ_VERSION_ENV} is v2 but {UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH_ENV} looks like a v1 path ({raw_env}). Using v2 default instead."
-            )
-            attempted_paths.append(path)
-        else:
-            path = raw_env
-    else:
-        path = R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS[version]
-        attempted_paths.append(path)
-
-    if state_file_override:
-        attempted_paths.append(state_file_override)
-        if version == "v2" and _looks_like_v1_dropbox_state_path(state_file_override):
-            ignored_state_file_override = state_file_override
-            state_file_override = ""
-            if source == "default:v2_ignored_v1_env_override":
-                source = "default:v2_ignored_v1_env_and_state_file_overrides"
-            elif source == "default":
-                source = "default:v2_ignored_v1_state_file_override"
-            warnings.append(
-                f"{R2_HISTORY_READ_VERSION_ENV} is v2 but {UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE_ENV} looks like a v1 checkpoint ({ignored_state_file_override}). Ignoring that override and using the resolved v2 checkpoint path."
-            )
-
-    cache_key = f"{version}:{path}:state_file={state_file_override or ''}"
-
-    return {
-        "path": path,
-        "source": source,
-        "cache_key": cache_key,
-        "warning": " ".join(warnings) if warnings else None,
-        "error": None,
-        "fallback_attempted": fallback_attempted,
-        "read_version": read_version_info,
-        "attempted_paths": attempted_paths,
-        "state_file_override": state_file_override or None,
-        "ignored_state_file_override": ignored_state_file_override,
-    }
-
-
-def _append_r2_history_read_version(params: Dict[str, str]) -> Dict[str, str]:
-    resolved = _resolve_r2_history_read_version()
-    if not resolved.get("valid"):
-        raise ValueError(str(resolved.get("warning") or "Invalid R2 history read version"))
-    params["read_version"] = str(resolved["version"])
-    return params
 
 
 def _resolve_r2_history_days_api_url() -> str:
@@ -1802,10 +1674,10 @@ def _normalize_dropbox_path(raw: str) -> str:
     return with_leading.rstrip("/")
 
 
-def _resolve_dropbox_state_remote_path(state_rel_path: str) -> str:
+def _resolve_dropbox_state_remote_path() -> str:
     root = str(UK_AQ_DROPBOX_ROOT or "").strip().strip("/")
     history_dir = str(UK_AQ_R2_HISTORY_DROPBOX_DIR or "").strip().strip("/")
-    state_rel = str(state_rel_path or "").strip().strip("/")
+    state_rel = str(UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH or "").strip().strip("/")
     path_parts = [part for part in (root, history_dir, state_rel) if part]
     if not path_parts:
         return ""
@@ -1872,9 +1744,9 @@ def _fetch_dropbox_access_token() -> Tuple[Optional[str], Optional[str]]:
     return token, None
 
 
-def _load_dropbox_backup_days_remote(state_rel_path: str) -> Tuple[Dict[str, Set[date]], Optional[str], Optional[str]]:
+def _load_dropbox_backup_days_remote() -> Tuple[Dict[str, Set[date]], Optional[str], Optional[str]]:
     domain_days = _empty_dropbox_backup_days()
-    remote_path = _resolve_dropbox_state_remote_path(state_rel_path)
+    remote_path = _resolve_dropbox_state_remote_path()
     if not remote_path:
         return domain_days, None, None
 
@@ -1913,15 +1785,9 @@ def _load_dropbox_backup_days_remote(state_rel_path: str) -> Tuple[Dict[str, Set
     return parsed_days, path_ref, parse_error
 
 
-def _candidate_dropbox_state_paths(
-    resolved_state_rel_path: Optional[str],
-    state_info: Optional[Dict[str, Any]] = None,
-) -> List[Path]:
+def _candidate_dropbox_state_paths() -> List[Path]:
     candidates: List[Path] = []
     seen: Set[str] = set()
-
-    if not resolved_state_rel_path:
-        return candidates
 
     def add_candidate(raw_path: Optional[Path]) -> None:
         if raw_path is None:
@@ -1933,10 +1799,8 @@ def _candidate_dropbox_state_paths(
         seen.add(key)
         candidates.append(expanded)
 
-    info = state_info or _resolve_dropbox_state_path_info()
-    state_file_override = str(info.get("state_file_override") or "").strip()
-    if state_file_override:
-        add_candidate(Path(state_file_override))
+    if UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE:
+        add_candidate(Path(UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE))
 
     local_roots: List[Path] = []
     if UK_AQ_DROPBOX_LOCAL_ROOT:
@@ -1947,7 +1811,7 @@ def _candidate_dropbox_state_paths(
 
     remote_root = UK_AQ_DROPBOX_ROOT.strip().strip("/")
     history_dir = UK_AQ_R2_HISTORY_DROPBOX_DIR.strip().strip("/")
-    state_rel_path = str(resolved_state_rel_path or "").strip().strip("/")
+    state_rel_path = UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH.strip().strip("/")
 
     def add_from_base(base_root: Path) -> None:
         path_parts: List[str] = [str(base_root)]
@@ -2002,14 +1866,9 @@ def _candidate_dropbox_history_dirs() -> List[Path]:
         seen.add(key)
         candidates.append(expanded)
 
-    state_info = _resolve_dropbox_state_path_info()
-    resolved_state_rel_path = state_info.get("path")
-    if not resolved_state_rel_path:
-        return candidates
-
-    for state_path in _candidate_dropbox_state_paths(resolved_state_rel_path, state_info=state_info):
+    for state_path in _candidate_dropbox_state_paths():
         rel_parts = [
-            part for part in str(resolved_state_rel_path or "").strip().strip("/").split("/")
+            part for part in str(UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH or "").strip().strip("/").split("/")
             if part
         ]
         history_path = state_path
@@ -2150,29 +2009,23 @@ def _get_dropbox_history_latest_mtime_cached(
     return payload, error
 
 
-def _load_dropbox_backup_days() -> Tuple[Dict[str, Set[date]], Optional[str], Optional[str], Dict[str, Any]]:
-    state_info = _resolve_dropbox_state_path_info()
-    resolved_path = state_info.get("path")
-
+def _load_dropbox_backup_days() -> Tuple[Dict[str, Set[date]], Optional[str], Optional[str]]:
     domain_days = _empty_dropbox_backup_days()
-    if not resolved_path:
-        return domain_days, None, state_info.get("error"), state_info
-
-    for candidate in _candidate_dropbox_state_paths(resolved_path, state_info=state_info):
+    for candidate in _candidate_dropbox_state_paths():
         if not candidate.is_file():
             continue
         try:
             raw_state = json.loads(candidate.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
-            return domain_days, str(candidate), f"Dropbox checkpoint parse failed ({exc.__class__.__name__})", state_info
+            return domain_days, str(candidate), f"Dropbox checkpoint parse failed ({exc.__class__.__name__})"
         parsed_days, parse_error = _extract_dropbox_backup_days(raw_state)
-        return parsed_days, str(candidate), parse_error, state_info
+        return parsed_days, str(candidate), parse_error
 
-    remote_days, remote_path, remote_error = _load_dropbox_backup_days_remote(resolved_path)
+    remote_days, remote_path, remote_error = _load_dropbox_backup_days_remote()
     if remote_path or remote_error:
-        return remote_days, remote_path, remote_error, state_info
+        return remote_days, remote_path, remote_error
 
-    return domain_days, None, None, state_info
+    return domain_days, None, None
 
 
 def _latest_oldest_day_by_label(
@@ -2397,17 +2250,13 @@ def _next_storage_coverage_refresh(now_utc: datetime) -> datetime:
 
 def _get_cached_storage_coverage_days(now: datetime) -> Optional[List[Dict[str, Any]]]:
     now_utc = now.astimezone(timezone.utc)
-    dropbox_state_info = _resolve_dropbox_state_path_info()
-    expected_cache_key = dropbox_state_info["cache_key"]
     with CACHE_LOCK:
         cached_rows = STORAGE_COVERAGE_CACHE_STATE.get("rows")
         next_refresh_at = STORAGE_COVERAGE_CACHE_STATE.get("next_refresh_at")
-        cached_key = STORAGE_COVERAGE_CACHE_STATE.get("cache_key")
         if (
             isinstance(cached_rows, list)
             and isinstance(next_refresh_at, datetime)
             and now_utc < next_refresh_at
-            and cached_key == expected_cache_key
         ):
             return list(cached_rows)
     return None
@@ -2423,9 +2272,6 @@ def _get_storage_coverage_days_cached(
     dropbox_backup_days: Optional[Dict[str, Set[date]]],
     r2_backup_window: Optional[Dict[str, Any]],
     r2_history_days: Optional[Dict[str, Set[date]]],
-    dropbox_state_path: Optional[str] = None,
-    dropbox_state_error: Optional[str] = None,
-    dropbox_state_info: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     cached_rows = _get_cached_storage_coverage_days(now)
     if isinstance(cached_rows, list):
@@ -2449,14 +2295,9 @@ def _get_storage_coverage_days_cached(
         day_sets=day_sets,
     )
     next_refresh_at = _next_storage_coverage_refresh(now_utc)
-    resolved_info = dropbox_state_info or _resolve_dropbox_state_path_info()
     with CACHE_LOCK:
         STORAGE_COVERAGE_CACHE_STATE["rows"] = rows
         STORAGE_COVERAGE_CACHE_STATE["next_refresh_at"] = next_refresh_at
-        STORAGE_COVERAGE_CACHE_STATE["cache_key"] = resolved_info["cache_key"]
-        STORAGE_COVERAGE_CACHE_STATE["dropbox_state_path"] = dropbox_state_path
-        STORAGE_COVERAGE_CACHE_STATE["dropbox_state_error"] = dropbox_state_error
-        STORAGE_COVERAGE_CACHE_STATE["dropbox_state_info"] = resolved_info
     return rows
 
 
@@ -2793,12 +2634,9 @@ def _fetch_r2_history_days_from_external_api(
     if not api_url:
         return None, None, None, "R2 history-days API not configured"
 
-    try:
-        params: Dict[str, str] = _append_r2_history_read_version({
-            "max_days": str(R2_HISTORY_DAYS_API_MAX_DAYS),
-        })
-    except ValueError as exc:
-        return None, None, None, str(exc)
+    params: Dict[str, str] = {
+        "max_days": str(R2_HISTORY_DAYS_API_MAX_DAYS),
+    }
 
     headers: Dict[str, str] = {
         "Accept": "application/json",
@@ -2871,13 +2709,6 @@ def _fetch_r2_history_days_from_external_api(
     r2_window["observations_day_count"] = len(observations_days)
     r2_window["aqilevels_day_count"] = len(aqilevels_days)
     r2_window["count_basis"] = "explicit_overlap_both_domains"
-
-    resolved_version = _resolve_r2_history_read_version()
-    r2_window["read_version"] = resolved_version["version"]
-    r2_window["read_version_label"] = resolved_version["label"]
-    r2_window["read_version_source"] = resolved_version["source"]
-    if resolved_version.get("warning"):
-        r2_window["read_version_warning"] = resolved_version["warning"]
 
     bucket_value = str(payload.get("bucket") or "").strip() or None
     return day_sets, r2_window, bucket_value, None
@@ -3012,14 +2843,11 @@ def _fetch_r2_history_counts_from_external_api(
     if not api_url:
         return None, "R2 history-counts API not configured"
 
-    try:
-        params: Dict[str, str] = _append_r2_history_read_version({
-            "from_day": from_day,
-            "to_day": to_day,
-            "grain": grain,
-        })
-    except ValueError as exc:
-        return None, str(exc)
+    params: Dict[str, str] = {
+        "from_day": from_day,
+        "to_day": to_day,
+        "grain": grain,
+    }
     if connector_ids:
         params["connector_ids"] = connector_ids
 
@@ -3948,7 +3776,7 @@ def _fetch_storage_coverage_context(
             r2_domain_size_metrics_error,
             r2_domain_filter_error,
         )
-    dropbox_backup_days, dropbox_state_path, dropbox_state_error, dropbox_state_info = _load_dropbox_backup_days()
+    dropbox_backup_days, dropbox_state_path, dropbox_state_error = _load_dropbox_backup_days()
     return {
         "db_size_metrics": db_size_metrics,
         "schema_size_metrics": schema_size_metrics,
@@ -3964,7 +3792,6 @@ def _fetch_storage_coverage_context(
         "dropbox_backup_days": dropbox_backup_days,
         "dropbox_state_path": dropbox_state_path,
         "dropbox_state_error": dropbox_state_error,
-        "dropbox_state_info": dropbox_state_info,
     }
 
 
@@ -3984,7 +3811,6 @@ def _empty_storage_coverage_context() -> Dict[str, Any]:
         "dropbox_backup_days": _empty_dropbox_backup_days(),
         "dropbox_state_path": None,
         "dropbox_state_error": None,
-        "dropbox_state_info": _resolve_dropbox_state_path_info(),
     }
 
 
@@ -4100,7 +3926,6 @@ def _build_dashboard(
     dropbox_backup_days = coverage_context["dropbox_backup_days"]
     dropbox_state_path = coverage_context["dropbox_state_path"]
     dropbox_state_error = coverage_context["dropbox_state_error"]
-    dropbox_state_info = coverage_context.get("dropbox_state_info") or _resolve_dropbox_state_path_info()
     ingest_runs = (
         _get_ingest_runs_cached(
             base_url,
@@ -4315,9 +4140,6 @@ def _build_dashboard(
             dropbox_backup_days=dropbox_backup_days,
             r2_backup_window=r2_backup_window,
             r2_history_days=r2_history_days,
-            dropbox_state_path=dropbox_state_path,
-            dropbox_state_error=dropbox_state_error,
-            dropbox_state_info=dropbox_state_info,
         )
 
     return {
@@ -4342,14 +4164,8 @@ def _build_dashboard(
         "r2_history_days_error": r2_history_days_error,
         "dropbox_backup_state_path": dropbox_state_path,
         "dropbox_backup_state_error": dropbox_state_error,
-        "dropbox_backup_state_source": dropbox_state_info.get("source"),
-        "dropbox_backup_state_attempted_paths": dropbox_state_info.get("attempted_paths", []),
-        "dropbox_backup_state_cache_key": dropbox_state_info.get("cache_key"),
-        "dropbox_backup_state_warning": dropbox_state_info.get("warning"),
-        "dropbox_backup_state_fallback_attempted": dropbox_state_info.get("fallback_attempted", False),
         "storage_coverage_source": "live_per_day_presence",
         "storage_coverage_days": storage_coverage_days,
-        "r2_history_read_version": dropbox_state_info.get("read_version"),
         "pollutants": pollutants_payload,
         "dispatch_runs": dispatch_runs,
         "dispatcher_settings": dispatcher_settings,
@@ -4431,28 +4247,12 @@ def _build_storage_coverage_payload(
             dropbox_backup_days=coverage_context["dropbox_backup_days"],
             r2_backup_window=coverage_context["r2_backup_window"],
             r2_history_days=coverage_context["r2_history_days"],
-            dropbox_state_path=coverage_context.get("dropbox_state_path"),
-            dropbox_state_error=coverage_context.get("dropbox_state_error"),
-            dropbox_state_info=coverage_context.get("dropbox_state_info"),
         )
-
-    with CACHE_LOCK:
-        dropbox_state_path = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_state_path")
-        dropbox_state_error = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_state_error")
-        dropbox_state_info = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_state_info") or _resolve_dropbox_state_path_info()
 
     return {
         "generated_at": now.isoformat().replace("+00:00", "Z"),
         "storage_coverage_source": "live_per_day_presence",
         "storage_coverage_days": storage_coverage_days,
-        "r2_history_read_version": dropbox_state_info.get("read_version"),
-        "dropbox_backup_state_path": dropbox_state_path,
-        "dropbox_backup_state_error": dropbox_state_error,
-        "dropbox_backup_state_source": dropbox_state_info.get("source"),
-        "dropbox_backup_state_attempted_paths": dropbox_state_info.get("attempted_paths", []),
-        "dropbox_backup_state_cache_key": dropbox_state_info.get("cache_key"),
-        "dropbox_backup_state_warning": dropbox_state_info.get("warning"),
-        "dropbox_backup_state_fallback_attempted": dropbox_state_info.get("fallback_attempted", False),
     }
 
 
@@ -5129,10 +4929,6 @@ def main() -> None:
     server.html_path = html_path
     server.upstream_bearer_token = str(os.getenv("DASHBOARD_UPSTREAM_BEARER_TOKEN") or "").strip()
 
-    r2_version = _resolve_r2_history_read_version()
-    print(f"UK AQ dashboard R2 history read version: {r2_version['label']} ({r2_version['source']})")
-    if r2_version.get("warning"):
-        print(f"UK AQ dashboard R2 history read version warning: {r2_version['warning']}")
     print(f"UK AQ dashboard running at http://{args.host}:{args.port}")
     server.serve_forever()
 
