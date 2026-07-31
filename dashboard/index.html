@@ -297,6 +297,11 @@
         animation: rise-in 0.55s ease both;
       }
 
+      .dispatch-panel {
+        position: relative;
+        z-index: 2;
+      }
+
       .panel h2 {
         margin: 0 0 14px;
         font-size: 22px;
@@ -600,6 +605,23 @@
         letter-spacing: -0.02em;
       }
 
+      .coverage-calendar-version {
+        display: inline-flex;
+        align-items: center;
+        border: 1px solid #d9cbb7;
+        border-radius: 999px;
+        padding: 0.18rem 0.48rem;
+        color: #6b6255;
+        background: #fffaf2;
+        font: 700 0.72rem/1 IBM Plex Mono, ui-monospace, monospace;
+      }
+
+      .coverage-calendar-version.is-warning {
+        border-color: #d9822b;
+        color: #8a4b12;
+        background: #fff3df;
+      }
+
       .coverage-calendar-nav {
         display: inline-flex;
         align-items: center;
@@ -862,19 +884,13 @@
       }
 
       .coverage-bar-dropbox-only-observs {
-        background: #ffffff;
-        border: 1px solid var(--color-r2-observs);
+        background: var(--color-r2-observs);
+        border: 0;
       }
 
       .coverage-bar-dropbox-only-aqilevels {
-        background: #ffffff;
-        border: 1px solid var(--color-r2-aqilevels);
-      }
-
-      .coverage-bar-dropbox-only-observs .coverage-bar-label,
-      .coverage-bar-dropbox-only-aqilevels .coverage-bar-label {
-        color: #000000;
-        text-shadow: none;
+        background: var(--color-r2-aqilevels);
+        border: 0;
       }
 
       .coverage-bar-aqilevels-striped {
@@ -917,6 +933,11 @@
         margin-bottom: 14px;
         color: #5f574c;
         font-size: 13px;
+      }
+
+      .coverage-connector-counts-note.is-warning {
+        color: #7b4a00;
+        font-weight: 700;
       }
 
       .coverage-connector-chart-grid {
@@ -1059,16 +1080,15 @@
 
       .coverage-square-dropbox-only-observs,
       .coverage-square-dropbox-only-aqilevels {
-        background-color: #ffffff;
         box-sizing: border-box;
       }
 
       .coverage-square-dropbox-only-observs {
-        border: 1px solid var(--color-r2-observs);
+        background-color: var(--color-r2-observs);
       }
 
       .coverage-square-dropbox-only-aqilevels {
-        border: 1px solid var(--color-r2-aqilevels);
+        background-color: var(--color-r2-aqilevels);
       }
 
       .coverage-square.has-backup-icon {
@@ -1617,6 +1637,79 @@
           grid-template-columns: 1fr;
         }
       }
+      .multi-select {
+        position: relative;
+        display: inline-block;
+        font-family: "Space Grotesk", "Segoe UI", sans-serif;
+      }
+      .multi-select summary {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: #fff;
+        color: var(--ink);
+        padding: 6px 9px;
+        font-size: 13px;
+        cursor: pointer;
+        list-style: none;
+        min-width: 140px;
+      }
+      .multi-select summary::-webkit-details-marker {
+        display: none;
+      }
+      .multi-select-menu {
+        position: absolute;
+        top: 100%;
+        left: 0;
+        margin-top: 4px;
+        background: #fff;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+        padding: 8px;
+        z-index: 100;
+        min-width: 180px;
+        max-height: 300px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .multi-select-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        cursor: pointer;
+        padding: 4px 6px;
+        border-radius: 6px;
+        color: var(--ink);
+      }
+      .multi-select-item:hover {
+        background: rgba(31, 122, 122, 0.05);
+      }
+      .multi-select-item input {
+        margin: 0;
+      }
+      .multi-select-actions {
+        margin-top: 6px;
+        padding-top: 6px;
+        border-top: 1px solid var(--border);
+        text-align: right;
+      }
+      .multi-select-actions button {
+        background: #fff;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 4px 12px;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--ink);
+        cursor: pointer;
+        transition: background 0.2s;
+      }
+      .multi-select-actions button:hover {
+        background: rgba(31, 122, 122, 0.05);
+      }
     </style>
   </head>
   <body>
@@ -1807,13 +1900,7 @@
       }
 
       const bucketOrder = ["0-3 Hours", "3-6 Hours", "6-24 Hours", "1 - 7 Days", "Older than 7 Days"];
-      const DISPATCH_CONNECTOR_OPTIONS = [
-        { value: "all", label: "All" },
-        { value: "uk_air_sos", label: "UK-AIR SOS" },
-        { value: "sensorcommunity", label: "Sensor.Community" },
-        { value: "breathelondon", label: "Breathe London" },
-        { value: "openaq", label: "OpenAQ" },
-      ];
+
       const DISPATCH_LOOKBACK_OPTIONS = [
         { value: 10, label: "10mins" },
         { value: 30, label: "30mins" },
@@ -1860,7 +1947,7 @@
       ];
       const COVERAGE_WEEKDAY_ABBREVIATIONS = ["M", "T", "W", "T", "F", "S", "S"];
       const REFRESH_OPTIONS_SECONDS = [60, 300, 600, 1800, 3600];
-      let dispatchConnectorFilter = "all";
+      let dispatchConnectorSet = new Set();
       let dispatchLookbackMinutes = 30;
       let dbSizePeriodHours = 24;
       let storageCoverageMonthCursor = null;
@@ -1868,6 +1955,7 @@
       let r2ConnectorCountsMode = "stacked";
       let latestDashboardData = null;
       let latestR2ConnectorCounts = null;
+      let latestR2HistoryReadVersion = { label: "R2_?", warning: "R2 history read version has not been reported by the dashboard API yet.", valid: false };
       let dashboardLoadSequence = 0;
       let storageCoverageLoadSequence = 0;
       let r2ConnectorCountsLoadSequence = 0;
@@ -1875,13 +1963,19 @@
       const R2_CONNECTOR_CHARTS = [
         {
           connectorId: 1,
-          title: "UK-AIR-SOS",
+          title: "SOS",
           observsColor: "#013566",
           aqiColor: "#015FA4",
         },
         {
+          connectorId: 2,
+          title: "Breathe London Nodes",
+          observsColor: "#4B443A",
+          aqiColor: "#A08D74",
+        },
+        {
           connectorId: 3,
-          title: "Breathe London",
+          title: "Breathe London Communities",
           observsColor: "#007A6C",
           aqiColor: "#279F8D",
         },
@@ -1924,8 +2018,20 @@
           dailyTaskRunsModeValue = storedDailyTaskRunsMode;
         }
         const storedConnector = localStorage.getItem(DISPATCH_CONNECTOR_STORAGE_KEY);
-        if (storedConnector && DISPATCH_CONNECTOR_OPTIONS.some((opt) => opt.value === storedConnector)) {
-          dispatchConnectorFilter = storedConnector;
+        if (storedConnector) {
+          if (storedConnector === "all") {
+            dispatchConnectorSet = new Set();
+          } else if (storedConnector.startsWith("[")) {
+            try {
+              const parsed = JSON.parse(storedConnector);
+              if (Array.isArray(parsed)) {
+                dispatchConnectorSet = new Set(parsed.map(normalizeConnectorCode).filter(Boolean));
+              }
+            } catch (_err) {}
+          } else {
+            const nc = normalizeConnectorCode(storedConnector);
+            if (nc) dispatchConnectorSet = new Set([nc]);
+          }
         }
         const storedLookback = Number(localStorage.getItem(DISPATCH_LOOKBACK_STORAGE_KEY));
         if (
@@ -1968,6 +2074,10 @@
       }
       if (!storageCoverageMonthCursor) {
         storageCoverageMonthCursor = startOfUtcMonth(new Date());
+      }
+
+      function normalizeConnectorCode(value) {
+        return String(value || "").trim().toLowerCase();
       }
 
       function escapeHtml(value) {
@@ -2931,10 +3041,42 @@
         return panel;
       }
 
-      function renderDispatchPanel(runs) {
+      function renderDispatchPanel(runs, connectorsSettings) {
+        const dynamicOptions = [];
+        (Array.isArray(connectorsSettings) ? connectorsSettings : []).forEach(c => {
+          const codeRaw = c.connector_code;
+          const code = normalizeConnectorCode(codeRaw);
+          if (!code) return;
+          const label = c.display_name || c.label || code;
+          dynamicOptions.push({ value: code, label: label });
+        });
+
+        const uniqueOptions = [];
+        const seenCodes = new Set();
+        dynamicOptions.forEach(opt => {
+          if (!seenCodes.has(opt.value)) {
+            seenCodes.add(opt.value);
+            uniqueOptions.push(opt);
+          }
+        });
+        uniqueOptions.sort((a, b) => a.label.localeCompare(b.label));
+
+        let changed = false;
+        for (const code of dispatchConnectorSet) {
+          if (!seenCodes.has(code)) {
+            dispatchConnectorSet.delete(code);
+            changed = true;
+          }
+        }
+        if (changed) {
+          try {
+            localStorage.setItem(DISPATCH_CONNECTOR_STORAGE_KEY, JSON.stringify(Array.from(dispatchConnectorSet)));
+          } catch (_err) {}
+        }
+
         const filteredRuns = (Array.isArray(runs) ? runs : []).filter((run) => {
-          const connectorCode = String((run && run.connector_code) || "").toLowerCase();
-          if (dispatchConnectorFilter !== "all" && connectorCode !== dispatchConnectorFilter) {
+          const connectorCode = normalizeConnectorCode(run && run.connector_code);
+          if (dispatchConnectorSet.size > 0 && !dispatchConnectorSet.has(connectorCode)) {
             return false;
           }
           if (dispatchLookbackMinutes <= 0) {
@@ -2953,19 +3095,32 @@
         });
 
         const panel = document.createElement("section");
-        panel.className = "panel";
+        panel.className = "panel dispatch-panel";
         panel.innerHTML = `
           <h2 class="panel-heading">
             <span>Dispatcher Feed</span>
             <div class="dispatch-filters">
-              <label class="dispatch-filter" for="dispatch-connector-filter">
+              <div class="dispatch-filter">
                 Connector
-                <select id="dispatch-connector-filter">
-                  ${DISPATCH_CONNECTOR_OPTIONS
-                    .map((opt) => `<option value="${opt.value}" ${opt.value === dispatchConnectorFilter ? "selected" : ""}>${opt.label}</option>`)
-                    .join("")}
-                </select>
-              </label>
+                <details class="multi-select" id="dispatch-connector-dropdown">
+                  <summary id="dispatch-connector-summary">${dispatchConnectorSet.size === 0 ? "All" : (dispatchConnectorSet.size === 1 ? escapeHtml(uniqueOptions.find(o => o.value === Array.from(dispatchConnectorSet)[0])?.label || "Unknown") : `${dispatchConnectorSet.size} selected`)}</summary>
+                  <div class="multi-select-menu">
+                    <label class="multi-select-item">
+                      <input type="checkbox" value="all" ${dispatchConnectorSet.size === 0 ? "checked" : ""}>
+                      All
+                    </label>
+                    ${uniqueOptions.map((opt) => `
+                      <label class="multi-select-item">
+                        <input type="checkbox" value="${escapeHtml(opt.value)}" ${dispatchConnectorSet.has(opt.value) ? "checked" : ""}>
+                        ${escapeHtml(opt.label)}
+                      </label>
+                    `).join("")}
+                    <div class="multi-select-actions">
+                      <button type="button" id="dispatch-connector-apply">Apply</button>
+                    </div>
+                  </div>
+                </details>
+              </div>
               <label class="dispatch-filter" for="dispatch-lookback-filter">
                 Lookback
                 <select id="dispatch-lookback-filter">
@@ -3028,21 +3183,48 @@
           <div class="footnote">Ordered by most recent run end time. Filters persist across refresh. Times in UTC.</div>
         `;
 
-        const connectorSelect = panel.querySelector("#dispatch-connector-filter");
-        if (connectorSelect) {
-          connectorSelect.addEventListener("change", (event) => {
-            const nextValue = String(event.target.value || "all");
-            if (!DISPATCH_CONNECTOR_OPTIONS.some((opt) => opt.value === nextValue)) {
-              return;
-            }
-            dispatchConnectorFilter = nextValue;
-            try {
-              localStorage.setItem(DISPATCH_CONNECTOR_STORAGE_KEY, dispatchConnectorFilter);
-            } catch (_err) {
-              // Ignore storage write issues.
-            }
-            loadDashboard();
+        const connectorDropdown = panel.querySelector("#dispatch-connector-dropdown");
+        if (connectorDropdown) {
+          const checkboxes = Array.from(connectorDropdown.querySelectorAll('input[type="checkbox"]'));
+          const applyBtn = connectorDropdown.querySelector("#dispatch-connector-apply");
+
+          let draftSet = new Set(dispatchConnectorSet);
+
+          checkboxes.forEach(cb => {
+            cb.addEventListener("change", (e) => {
+              if (e.target.value === "all") {
+                if (e.target.checked) {
+                  draftSet.clear();
+                  checkboxes.forEach(c => { if (c.value !== "all") c.checked = false; });
+                } else {
+                  e.target.checked = true; // Cannot uncheck 'all' directly
+                }
+              } else {
+                const allCb = checkboxes.find(c => c.value === "all");
+                if (e.target.checked) {
+                  draftSet.add(e.target.value);
+                  if (allCb) allCb.checked = false;
+                } else {
+                  draftSet.delete(e.target.value);
+                }
+
+                if (draftSet.size === 0 && allCb) {
+                  allCb.checked = true;
+                }
+              }
+            });
           });
+
+          if (applyBtn) {
+            applyBtn.addEventListener("click", () => {
+              dispatchConnectorSet = new Set(draftSet);
+              try {
+                localStorage.setItem(DISPATCH_CONNECTOR_STORAGE_KEY, JSON.stringify(Array.from(dispatchConnectorSet)));
+              } catch (_err) {}
+              connectorDropdown.removeAttribute("open");
+              loadDashboard();
+            });
+          }
         }
         const lookbackSelect = panel.querySelector("#dispatch-lookback-filter");
         if (lookbackSelect) {
@@ -4399,7 +4581,7 @@
             aqiColor: "#A08D74",
           });
         });
-        return resolved;
+        return resolved.sort((a, b) => Number(a.connectorId) - Number(b.connectorId));
       }
 
       function buildEmptyConnectorBuckets(request) {
@@ -4622,6 +4804,22 @@
         const subtitle = isYearMode
           ? "Year view shows monthly average rows per day. Stacked mode places AQI on the bottom and Observs on the top."
           : "Month view shows daily row totals. Stacked mode places AQI on the bottom and Observs on the top.";
+        const payloadWarningParts = [];
+        if (payload && payload.read_version_label) {
+          payloadWarningParts.push(`active version ${payload.read_version_label}`);
+        }
+        if (payload && payload.error) {
+          const attemptedKeys = payload.index_keys && typeof payload.index_keys === "object"
+            ? Object.values(payload.index_keys).filter(Boolean).join(", ")
+            : "unknown index key";
+          payloadWarningParts.push(`index warning: ${payload.error}; attempted ${attemptedKeys}`);
+        }
+        if (payload && payload.read_version_warning) {
+          payloadWarningParts.push(payload.read_version_warning);
+        }
+        const payloadWarningMarkup = payloadWarningParts.length
+          ? `<div class="coverage-connector-counts-note is-warning">${escapeHtml(payloadWarningParts.join(" • "))}</div>`
+          : "";
 
         container.innerHTML = `
           <div class="coverage-connector-counts-head">
@@ -4634,6 +4832,7 @@
             </div>
           </div>
           <div class="coverage-connector-counts-note">${escapeHtml(subtitle)}</div>
+          ${payloadWarningMarkup}
           ${bodyMarkup}
         `;
 
@@ -4872,13 +5071,18 @@
           : formatCoverageMonthTitle(monthStartUtc);
         const previousLabel = isYearMode ? "&lt; Previous Year" : "&lt; Previous";
         const nextLabel = isYearMode ? "Next Year &gt;" : "Next &gt;";
+        const r2Version = options.r2HistoryReadVersion || latestR2HistoryReadVersion || {};
+        const r2VersionLabel = String(r2Version.label || (r2Version.version ? `R2_${r2Version.version}` : "R2_?"));
+        const r2VersionWarning = String(r2Version.warning || "");
+        const r2VersionClass = r2VersionWarning || r2Version.valid === false ? " is-warning" : "";
+        const r2VersionTitle = r2VersionWarning || `${r2VersionLabel} selected by UK_AQ_R2_HISTORY_VERSION`;
 
         let bodyMarkup = "";
         let footnoteText = "";
         if (isYearMode) {
           const yearStartUtc = new Date(Date.UTC(monthStartUtc.getUTCFullYear(), 0, 1, 0, 0, 0, 0));
           bodyMarkup = renderCoverageYearGrid(yearStartUtc, resolved.rows);
-          footnoteText = "Squares only and complete days only (today excluded). With ingest: red top-left and blue/green on the bottom row. Without ingest: blue/green on top row and R2 orange/yellow on bottom row. Dropbox-only backup days render as white squares with orange/yellow borders and a blue Dropbox icon.";
+          footnoteText = "Squares only and complete days only (today excluded). With ingest: red top-left and blue/green on the bottom row. Without ingest: blue/green on top row and R2 orange/yellow on bottom row. Backup-only days use the same filled orange/yellow storage colours with a blue Dropbox icon.";
         } else {
           const calendarCells = buildCoverageCalendarCells(monthStartUtc, resolved.rows, true);
           const cellsMarkup = calendarCells
@@ -4924,12 +5128,13 @@
             })
             .join("");
           bodyMarkup = `<div class="coverage-calendar-grid">${cellsMarkup}</div>`;
-          footnoteText = "Top: Ingest DB (red), R2 History - Obs (orange), or Dropbox-only Backup - Obs (white with orange border). Middle: ObsAQI DB - Obs (blue). Bottom: AQI (yellow/green, striped when both R2 + ObsAQI are present) or Dropbox-only Backup - AQI (white with yellow border). R2 bars with Dropbox copy show a second line (blue Dropbox icon + Backup). Today shows half-width bars.";
+          footnoteText = "Top: Ingest DB (red), R2 History - Obs (orange), or Backup - Obs (orange filled). Middle: ObsAQI DB - Obs (blue). Bottom: AQI (yellow/green, striped when both R2 + ObsAQI are present) or Backup - AQI (yellow filled). R2 bars with Dropbox copy show a second line (blue Dropbox icon + Backup). Today shows half-width bars.";
         }
 
         panel.innerHTML = `
           <div class="coverage-calendar-head">
             <h2 class="coverage-calendar-title">${escapeHtml(titleText)}</h2>
+            <span class="coverage-calendar-version${r2VersionClass}" title="${escapeHtml(r2VersionTitle)}">${escapeHtml(r2VersionLabel)}</span>
             <div class="coverage-calendar-nav">
               <span class="coverage-calendar-view">
                 <span class="coverage-calendar-view-label">View</span>
@@ -4958,6 +5163,7 @@
           </div>
           ${bodyMarkup}
           <div class="footnote">${escapeHtml(footnoteText)}</div>
+          ${r2VersionWarning ? `<div class="footnote">${escapeHtml(r2VersionWarning)}</div>` : ""}
           <div class="coverage-connector-counts-section" data-role="r2-connector-counts"></div>
         `;
 
@@ -5057,7 +5263,7 @@
       }
 
       function renderConnectorSettingsPanel(connectors) {
-        const schedulerBackendAllowlist = new Set(["uk_air_sos", "sensorcommunity", "breathelondon", "openaq"]);
+        const schedulerBackendAllowlist = new Set(["sos", "sensorcommunity", "breathelondon", "openaq"]);
         const panel = document.createElement("section");
         panel.className = "panel";
         panel.innerHTML = `
@@ -5334,10 +5540,14 @@
             latestDashboardData.storage_coverage_days = coverageRows;
             latestDashboardData.storage_coverage_source =
               data.storage_coverage_source || "live_per_day_presence";
+            latestDashboardData.r2_history_read_version =
+              data.r2_history_read_version || latestDashboardData.r2_history_read_version;
           }
+          latestR2HistoryReadVersion = data.r2_history_read_version || latestR2HistoryReadVersion;
           upsertStorageCoveragePanel(
             renderStorageCoverageCalendarPanel(coverageRows, {
               forceConnectorCountsRefresh: forceRefresh,
+              r2HistoryReadVersion: latestR2HistoryReadVersion,
             }),
           );
           if (String(errorEl.textContent || "").startsWith(STORAGE_COVERAGE_ERROR_PREFIX)) {
@@ -6059,6 +6269,7 @@
           }
           const data = payload || {};
           latestDashboardData = data;
+          latestR2HistoryReadVersion = data.r2_history_read_version || latestR2HistoryReadVersion;
           const existingDailyTaskPanel = operationsContainer.querySelector('[data-panel="operations-daily-task"]');
           const nextPanels = [
             renderModeControlPanel("operations"),
@@ -6200,7 +6411,7 @@
             nextPanels.push(renderDispatcherSettingsPanel(data.dispatcher_settings));
           }
           if (Array.isArray(data.dispatch_runs)) {
-            nextPanels.push(renderDispatchPanel(data.dispatch_runs));
+            nextPanels.push(renderDispatchPanel(data.dispatch_runs, data.connectors_settings));
           }
           (Array.isArray(data.pollutants) ? data.pollutants : []).forEach((pollutant) => {
             nextPanels.push(renderPanel(pollutant));
